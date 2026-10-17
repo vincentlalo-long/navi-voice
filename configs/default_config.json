@@ -1,0 +1,35 @@
+{
+  "speaker": {
+    "name": "Speaker",
+    "language": "JA",
+    "file_prefix": "audio"
+  },
+  "paths": {
+    "raw_dir": "datasets/raw",
+    "output_dir": "datasets/processed",
+    "slices_subfolder": "slices",
+    "metadata_json": "metadata.json",
+    "metadata_csv": "metadata.csv",
+    "dataset_list": "dataset.list"
+  },
+  "audio": {
+    "slicer_method": "energy",
+    "sample_rate": 44100,
+    "target_peak_db": -1.0,
+    "silence_threshold_db": -38.0,
+    "min_length_ms": 2000,
+    "max_length_ms": 12000,
+    "min_interval_ms": 400,
+    "hop_size_ms": 10,
+    "max_sil_kept_ms": 400,
+    "min_speech_ms": 800,
+    "vad_min_speech_ms": 250
+  },
+  "asr": {
+    "model_size": "large-v3",
+    "device": "cuda",
+    "compute_type": "float16",
+    "beam_size": 5,
+    "language": "ja"
+  }
+}

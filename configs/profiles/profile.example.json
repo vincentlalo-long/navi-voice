@@ -1,0 +1,36 @@
+{
+  "_comment": "Example profile template. Duplicate this file to define custom character archetypes (e.g. Tsundere, Kuudere, Analytical, Heroic, etc.).",
+  "speaker": {
+    "name": "CharacterName",
+    "language": "JA",
+    "file_prefix": "char"
+  },
+  "paths": {
+    "dataset_list": "dataset.list"
+  },
+  "emotion_rules": {
+    "high_emotion": {
+      "label": "High-Emotion/Agitated",
+      "keywords": ["！", "!!", "やめて", "嘘でしょ"]
+    },
+    "defensive_flustered": {
+      "label": "Defensive/Flustered",
+      "keywords": ["バカ", "べ、別に", "ちょっと", "違うわよ", "あんた"]
+    },
+    "gentle_soft": {
+      "label": "Gentle/Affectionate",
+      "keywords": ["ありがとう", "大丈夫", "そばに", "…ね"],
+      "whisper_threshold_db": -32.0,
+      "whisper_label": "Gentle/Whisper"
+    },
+    "intellectual_analytical": {
+      "label": "Intellectual/Analytical",
+      "keywords": ["理論", "仮説", "実験", "分析", "データ"]
+    },
+    "playful_teasing": {
+      "label": "Playful/Teasing",
+      "keywords": ["ふふっ", "面白い", "どうかしら"]
+    },
+    "default_label": "Neutral/Dialogue"
+  }
+}

@@ -1,0 +1,64 @@
+# ==============================================================================
+# Git Ignore Configuration - Amadeus Voice Pipeline
+# ==============================================================================
+
+# --- Documentation & Datasets ---
+docs/
+datasets/
+
+# --- Audio & Media Files (Large Binaries) ---
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+*.aac
+*.wma
+*.mkv
+*.webm
+
+# --- Python Virtual Environments ---
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+!.env.example
+
+# --- Python Bytecode & Caches ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- Machine Learning Models & Weights ---
+*.pt
+*.pth
+*.onnx
+*.bin
+*.safetensors
+models/
+checkpoints/
+
+# --- Private Speaker Profiles (Strictly Private) ---
+configs/profiles/*.json
+!configs/profiles/profile.example.json
+
+
+# --- Logs, Temp & OS Files ---
+*.log
+logs/
+*.tmp
+*.temp
+*~
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.sublime-workspace

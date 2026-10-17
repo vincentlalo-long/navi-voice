@@ -1,0 +1,11 @@
+# Voice Processing Pipeline Dependencies
+faster-whisper>=1.0.0
+soundfile>=0.12.1
+numpy>=1.24.0,<2.0.0
+scipy>=1.10.0
+tqdm>=4.66.0
+torch>=2.0.0
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
+silero-vad>=6.0.0
+matplotlib>=3.7.0
