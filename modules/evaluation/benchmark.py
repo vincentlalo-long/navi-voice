@@ -10,7 +10,6 @@ import numpy as np
 import soundfile as sf
 
 from modules.slicers.factory import get_slicer, SLICER_DISPATCH
-from modules.audio_utils import apply_raised_cosine_fade, normalize_peak
 from .boundary import evaluate_slice_boundary, aggregate_boundary_metrics
 from .segmentation import compute_segmentation_integrity
 from .visualize import (
@@ -84,9 +83,7 @@ class BenchmarkSuite:
             # Evaluate each slice boundary
             for s, e in chunks:
                 chunk_audio = data[s:e]
-                faded = apply_raised_cosine_fade(chunk_audio, target_sampling_rate, fade_ms=5.0)
-                normed = normalize_peak(faded, target_peak_db=-1.0, max_gain_db=18.0)
-                b_eval = evaluate_slice_boundary(normed, target_sampling_rate)
+                b_eval = evaluate_slice_boundary(chunk_audio, target_sampling_rate)
                 all_slice_metrics.append(b_eval)
                 all_chunks_info.append({"start": s, "end": e, "duration": (e - s) / target_sampling_rate})
 

@@ -7,7 +7,7 @@ import re
 import numpy as np
 import scipy.signal
 from .base import BaseSlicer
-import modules.cuda_utils  # Ensure CUDA shared libraries are pre-loaded
+from .. import cuda_utils  # Ensure CUDA shared libraries are pre-loaded
 
 
 class WhisperXSlicer(BaseSlicer):
@@ -233,13 +233,16 @@ class WhisperXSlicer(BaseSlicer):
             cur_duration = cur_sentence_words[-1].end - cur_sentence_words[0].start
 
             # Conditions to cut into a sentence:
-            # 1. End punctuation (。) followed by non-trivial gap or EOF
-            # 2. Large pause (> 1.0s) even without punctuation
-            # 3. Exceeds max duration (> max_dur_sec) and hits a clause mark (、) or pause
+            # 1. End punctuation (。)
+            # 2. Pause (>= min_sil_sec) when minimum sentence length reached
+            # 3. Clause mark (、) when sentence duration reaches 75% of max
+            # 4. Exceeds max duration
             should_cut = False
             if is_end_punct:
                 should_cut = True
             elif gap_to_next >= min_sil_sec and cur_duration >= (self.min_length_ms / 1000.0):
+                should_cut = True
+            elif is_clause_punct and cur_duration >= (max_dur_sec * 0.75):
                 should_cut = True
             elif cur_duration >= max_dur_sec:
                 should_cut = True

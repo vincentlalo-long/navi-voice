@@ -24,7 +24,7 @@ voice/
 │   ├── default_config.json        # Base pipeline configuration (thresholds, ASR settings)
 │   └── profiles/
 │       ├── profile.example.json   # Template for speaker-specific categorization
-│       └── *.json                 # Local custom profiles (e.g. kurisu.json)
+│       └── *.json                 # Local custom profiles (e.g. my_speaker.json)
 ├── datasets/
 │   ├── raw/                       # Source raw audio files (.wav, .mp3, .flac)
 │   └── processed/                 # Separated output folders per slicer (energy/, silero/, ...)
@@ -87,13 +87,13 @@ Place your raw source audio files in `datasets/raw/`.
 
 **1. Full Pipeline (Slicing + Peak Normalization + Whisper ASR + Category Tagging):**
 ```bash
-.venv/bin/python scripts/voice_dataset_miner.py --profile kurisu --slicer energy
+.venv/bin/python scripts/voice_dataset_miner.py --slicer energy
 ```
 
 **2. Slicing Only (Skip Whisper ASR):**
 When you only want to extract audio slices and metadata without spending GPU time transcribing:
 ```bash
-.venv/bin/python scripts/voice_dataset_miner.py --profile kurisu --slicer energy --skip-transcribe
+.venv/bin/python scripts/voice_dataset_miner.py --slicer energy --skip-transcribe
 ```
 
 **3. Dry-run Test (Process first 60 seconds):**
@@ -107,7 +107,7 @@ Generated slices and metadata (`metadata.json`, `metadata.csv`, `dataset.list`) 
 
 ## 5. Multi-Algorithm Benchmarking & Empirical Findings
 
-The benchmark suite was evaluated on **3.42 hours (12,301 seconds)** of continuous Japanese visual novel dialogue (`kurisu_raw.wav`):
+The benchmark suite was evaluated on **3.42 hours (12,301 seconds)** of continuous Japanese visual novel dialogue (`dialogue_raw.wav`):
 
 ```bash
 .venv/bin/python scripts/run_benchmark.py --slicers energy silero webrtc whisper

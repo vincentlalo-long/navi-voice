@@ -9,3 +9,4 @@ nvidia-cublas-cu12
 nvidia-cudnn-cu12
 silero-vad>=6.0.0
 matplotlib>=3.7.0
+webrtcvad-wheels>=2.0.10

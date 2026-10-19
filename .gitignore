@@ -62,3 +62,4 @@ Thumbs.db
 .idea/
 .vscode/
 *.sublime-workspace
+.licenses/

@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/env python3
 """
 Benchmark Runner CLI - Multi-Slicer Comparative Evaluation.
 Evaluates Energy, Silero, WebRTC, and WhisperX against Boundary Quality,

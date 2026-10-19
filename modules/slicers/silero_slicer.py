@@ -59,7 +59,13 @@ class SileroSlicer(BaseSlicer):
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", category=FutureWarning)
                     from silero_vad import load_silero_vad
-                    self._model = load_silero_vad(onnx=False)
+                    model = load_silero_vad(onnx=False)
+                    if self.device != "cpu":
+                        try:
+                            model = model.to(self.device)
+                        except Exception:
+                            self.device = "cpu"
+                    self._model = model 
             except ImportError:
                 raise ImportError(
                     "silero-vad is required for Neural VAD. Run: uv pip install silero-vad"
@@ -101,7 +107,7 @@ class SileroSlicer(BaseSlicer):
         else:
             resampled = waveform.astype(np.float32)
 
-        tensor_audio = torch.from_numpy(resampled)
+        tensor_audio = torch.from_numpy(resampled).to(self.device)
 
         # vad_min_speech_ms (250ms) suppresses blips/clicks while keeping short words
         speech_timestamps = get_speech_timestamps(

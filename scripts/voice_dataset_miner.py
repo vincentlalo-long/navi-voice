@@ -127,7 +127,7 @@ def main():
         "--profile",
         type=str,
         default=None,
-        help="Optional profile name (e.g. 'kurisu') or path to overlay profile JSON",
+        help="Optional profile name (e.g. 'my_speaker') or path to overlay profile JSON",
     )
     parser.add_argument(
         "--slicer",
@@ -204,6 +204,11 @@ def main():
     asr_cfg = config.get("asr", {})
     model_size = args.model_size or asr_cfg.get("model_size", "large-v3")
     device = args.device or asr_cfg.get("device", "cuda")
+    if device == "cuda":
+        import torch
+        if not torch.cuda.is_available():
+            print("[!] Warning: CUDA is not available on this machine. Falling back to CPU.")
+            device = "cpu"
     compute_type = asr_cfg.get("compute_type", "float16")
     language = asr_cfg.get("language", "ja")
     beam_size = int(asr_cfg.get("beam_size", 5))
