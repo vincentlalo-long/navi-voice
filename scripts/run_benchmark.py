@@ -36,14 +36,20 @@ def main():
     parser.add_argument(
         "--slicers",
         nargs="+",
-        default=["energy", "silero", "webrtc", "whisper"],
-        help="List of slicers to compare: energy, silero, webrtc, whisper",
+        default=["energy", "silero", "webrtc", "whisper", "hybrid"],
+        help="List of slicers to compare: energy, silero, webrtc, whisper, hybrid",
     )
     parser.add_argument(
         "--sample-seconds",
         type=float,
         default=None,
         help="Optional dry run duration in seconds per file (default: None, processes full audio)",
+    )
+    parser.add_argument(
+        "--model-size",
+        type=str,
+        default=None,
+        help="Whisper model size for benchmark (default: 'base' or from config)",
     )
     parser.add_argument(
         "--config",
@@ -63,6 +69,25 @@ def main():
             cfg = json.load(f)
 
     audio_cfg = cfg.get("audio", {})
+    asr_cfg = cfg.get("asr", {})
+
+    device = str(asr_cfg.get("device", "cuda"))
+    if device == "cuda":
+        import torch
+
+        if not torch.cuda.is_available():
+            print("[!] Warning: CUDA is not available. Falling back to CPU.")
+            device = "cpu"
+
+    bench_cfg = audio_cfg.copy()
+    model_size = args.model_size or str(audio_cfg.get("whisper_model_size", "base"))
+    bench_cfg.update({
+        "device": device,
+        "model_size": model_size,
+        "compute_type": str(asr_cfg.get("compute_type", "float16")),
+        "language": str(asr_cfg.get("language", "ja")),
+    })
+    bench_cfg.setdefault("whisper_model_size", model_size)
 
     raw_files = sorted(
         list(raw_path.glob("*.wav")) + list(raw_path.glob("*.mp3")) + list(raw_path.glob("*.flac"))
@@ -77,7 +102,7 @@ def main():
     print(f"AMADEUS VOICE BENCHMARK | Target: {len(raw_files)} files | Mode: {sample_desc} | Slicers: {args.slicers}")
     print("=" * 88)
 
-    suite = BenchmarkSuite(config=audio_cfg, output_dir=out_path)
+    suite = BenchmarkSuite(config=bench_cfg, output_dir=out_path)
     results = suite.run_full_benchmark(
         args.slicers, raw_files, sample_seconds=args.sample_seconds
     )

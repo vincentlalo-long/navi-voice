@@ -8,6 +8,7 @@ from .energy_slicer import EnergySlicer
 from .silero_slicer import SileroSlicer
 from .webrtc_slicer import WebRTCSlicer
 from .whisper_slicer import WhisperXSlicer
+from .hybrid_slicer import HybridSlicer
 
 # Dictionary Dispatch Table: Map algorithm aliases directly to Slicer classes
 SLICER_DISPATCH: Dict[str, Type[BaseSlicer]] = {
@@ -27,6 +28,9 @@ SLICER_DISPATCH: Dict[str, Type[BaseSlicer]] = {
     "whisper": WhisperXSlicer,
     "whisperx": WhisperXSlicer,
     "semantic": WhisperXSlicer,
+    # Hybrid: Whisper Semantic Macro-Grouping + DSP Micro-Refinement
+    "hybrid": HybridSlicer,
+    "semantic_acoustic": HybridSlicer,
 }
 
 

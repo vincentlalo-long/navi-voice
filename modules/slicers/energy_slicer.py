@@ -25,6 +25,7 @@ class EnergySlicer(BaseSlicer):
         hop_size_ms: int = 10,
         max_sil_kept_ms: int = 400,
         min_speech_ms: int = 800,
+        adaptive_threshold: bool = False,
     ):
         self.threshold_db = threshold_db
         # Dual-threshold Schmitt trigger: +2 dB to turn speech on, -4 dB to turn speech off
@@ -36,10 +37,17 @@ class EnergySlicer(BaseSlicer):
         self.hop_size_ms = hop_size_ms
         self.max_sil_kept_ms = max_sil_kept_ms
         self.min_speech_ms = min_speech_ms
+        self.adaptive_threshold = adaptive_threshold
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> "EnergySlicer":
         """Instantiate EnergySlicer by extracting relevant hyperparameters from config."""
+        adaptive_raw = config.get("adaptive_threshold", False)
+        adaptive_threshold = (
+            adaptive_raw.strip().lower() in ("true", "1", "yes")
+            if isinstance(adaptive_raw, str)
+            else bool(adaptive_raw)
+        )
         return cls(
             threshold_db=float(config.get("silence_threshold_db", -38.0)),
             min_length_ms=int(config.get("min_length_ms", 2000)),
@@ -48,6 +56,7 @@ class EnergySlicer(BaseSlicer):
             hop_size_ms=int(config.get("hop_size_ms", 10)),
             max_sil_kept_ms=int(config.get("max_sil_kept_ms", 400)),
             min_speech_ms=int(config.get("min_speech_ms", 800)),
+            adaptive_threshold=adaptive_threshold,
         )
 
     def _get_rms(self, waveform: np.ndarray, frame_length: int, hop_length: int) -> np.ndarray:
@@ -89,13 +98,20 @@ class EnergySlicer(BaseSlicer):
 
         rms = self._get_rms(waveform, hop_size * 2, hop_size)
 
+        t_high, t_low = self.threshold_high, self.threshold_low
+        if self.adaptive_threshold and len(rms) > 0:
+            p10 = float(np.percentile(20 * np.log10(rms + 1e-9), 10))
+            dyn_thresh = float(np.clip(p10 + 6.0, -48.0, -28.0))
+            t_high = 10 ** ((dyn_thresh + 2.0) / 20.0)
+            t_low = 10 ** ((dyn_thresh - 4.0) / 20.0)
+
         # Schmitt Trigger Hysteresis to eliminate chattering around threshold
         is_speech = False
         speech_mask = np.zeros(len(rms), dtype=bool)
         for i, r in enumerate(rms):
-            if not is_speech and r >= self.threshold_high:
+            if not is_speech and r >= t_high:
                 is_speech = True
-            elif is_speech and r < self.threshold_low:
+            elif is_speech and r < t_low:
                 is_speech = False
             speech_mask[i] = is_speech
 

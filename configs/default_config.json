@@ -23,7 +23,10 @@
     "hop_size_ms": 10,
     "max_sil_kept_ms": 400,
     "min_speech_ms": 800,
-    "vad_min_speech_ms": 250
+    "vad_min_speech_ms": 250,
+    "normalization_method": "peak",
+    "target_lufs": -20.0,
+    "adaptive_threshold": false
   },
   "asr": {
     "model_size": "large-v3",

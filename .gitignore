@@ -3,7 +3,8 @@
 # ==============================================================================
 
 # --- Documentation & Datasets ---
-docs/
+docs/*
+!docs/*.pdf
 datasets/
 
 # --- Audio & Media Files (Large Binaries) ---

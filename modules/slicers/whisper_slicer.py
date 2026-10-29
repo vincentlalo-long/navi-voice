@@ -61,17 +61,46 @@ class WhisperXSlicer(BaseSlicer):
         )
 
     def _get_model(self):
-        """Lazy loader for Faster-Whisper neural model."""
+        """Lazy loader for Faster-Whisper ASR model."""
         if self._model is None:
             from faster_whisper import WhisperModel
+
+            actual_compute = self.compute_type if self.device == "cuda" else "int8"
             try:
                 self._model = WhisperModel(
-                    self.model_size, device=self.device, compute_type=self.compute_type
+                    self.model_size,
+                    device=self.device,
+                    compute_type=actual_compute,
                 )
-            except Exception:
-                # Fallback to CPU if CUDA fails
-                self._model = WhisperModel(self.model_size, device="cpu", compute_type="int8")
+            except Exception as exc:
+                # Automatic graceful fallback to CPU if CUDA initialization fails
+                import warnings
+
+                warnings.warn(
+                    f"Faster-Whisper CUDA init failed ({exc}); falling back to CPU. "
+                    "This will be much slower and CPU-heavy.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self.device = "cpu"
+                self._model = WhisperModel(
+                    self.model_size,
+                    device="cpu",
+                    compute_type="int8",
+                )
         return self._model
+
+    @staticmethod
+    def _resample_to_16k(audio: np.ndarray, sampling_rate: int) -> np.ndarray:
+        """Polyphase anti-aliased resampling to 16kHz for Whisper."""
+        target_sr = 16000
+        if sampling_rate == target_sr:
+            return audio.astype(np.float32)
+
+        gcd = np.gcd(sampling_rate, target_sr)
+        up = target_sr // gcd
+        down = sampling_rate // gcd
+        return scipy.signal.resample_poly(audio, up, down).astype(np.float32)
 
     @staticmethod
     def _find_clean_split_point(waveform: np.ndarray, target_idx: int, window: int) -> int:
@@ -89,47 +118,40 @@ class WhisperXSlicer(BaseSlicer):
             return int(w_start + best_idx)
         return int(w_start + np.argmin(np.abs(sub_wave)))
 
-    @staticmethod
-    def _find_chunk_split_index(waveform: np.ndarray, target_sample: int, search_radius: int) -> int:
-        """Find the lowest energy zero-crossing point near target_sample to cleanly split long audio."""
-        start = max(0, target_sample - search_radius)
-        end = min(len(waveform), target_sample + search_radius)
-        if end <= start:
-            return target_sample
+    def _find_chunk_split_index(
+        self,
+        waveform: np.ndarray,
+        target_idx: int,
+        search_radius: int,
+        sampling_rate: int,
+    ) -> int:
+        """Find the best split point within search_radius of target_idx using RMS energy dips."""
+        w_start = max(0, target_idx - search_radius)
+        w_end = min(len(waveform), target_idx + search_radius)
+        if w_end <= w_start:
+            return target_idx
 
-        sub = waveform[start:end]
-        win_size = 4410  # 100ms at 44.1k
-        if len(sub) < win_size * 2:
-            return target_sample
+        sub = waveform[w_start:w_end]
+        hop = max(1, int(round(sampling_rate * 0.010)))
+        win = max(2, int(round(sampling_rate * 0.020)))
+        if len(sub) < win * 2:
+            return self._find_clean_split_point(waveform, target_idx, search_radius)
 
-        sub_trimmed = sub[:len(sub) - (len(sub) % win_size)]
-        sub_reshaped = sub_trimmed.reshape(-1, win_size)
-        energies = np.mean(sub_reshaped ** 2, axis=1)
-        min_frame_idx = int(np.argmin(energies))
-        frame_start = start + min_frame_idx * win_size
+        pad_w = win // 2
+        padded = np.pad(sub, (pad_w, pad_w), mode="reflect")
+        shape = (int((len(padded) - win) / hop) + 1, win)
+        strides = (padded.strides[0] * hop, padded.strides[0])
+        frames = np.lib.stride_tricks.as_strided(padded, shape=shape, strides=strides)
+        rms = np.sqrt(np.mean(frames**2, axis=-1))
 
-        frame = waveform[frame_start : frame_start + win_size]
-        sign_changes = np.where(np.diff(np.signbit(frame)))[0]
-        if len(sign_changes) > 0:
-            best_zc = sign_changes[np.argmin(np.abs(frame[sign_changes]))]
-            return int(frame_start + best_zc)
-        return int(frame_start + win_size // 2)
+        min_frame_idx = int(np.argmin(rms))
+        best_rough_idx = w_start + min_frame_idx * hop
+        return self._find_clean_split_point(waveform, best_rough_idx, hop)
 
-    @staticmethod
-    def _resample_to_16k(audio: np.ndarray, sampling_rate: int) -> np.ndarray:
-        """Polyphase resample audio chunk to 16000 Hz."""
-        target_sr = 16000
-        if sampling_rate == target_sr:
-            return audio.astype(np.float32)
-        gcd = np.gcd(sampling_rate, target_sr)
-        up = target_sr // gcd
-        down = sampling_rate // gcd
-        return scipy.signal.resample_poly(audio, up, down).astype(np.float32)
-
-    def slice(self, waveform: np.ndarray, sampling_rate: int) -> List[Tuple[int, int]]:
+    def _extract_words(self, waveform: np.ndarray, sampling_rate: int) -> List[Any]:
         """
-        Segment waveform based on word timestamps, punctuation boundaries, and silence pauses.
-        Uses 5-minute memory-capped streaming blocks to prevent Out-Of-Memory (OOM) on long files.
+        Extract word timestamps using streaming chunking (5-minute blocks)
+        to prevent VRAM exhaustion and GPU OOM on long audio.
         """
         model = self._get_model()
         total_samples = len(waveform)
@@ -139,7 +161,6 @@ class WhisperXSlicer(BaseSlicer):
         all_words = []
 
         if total_duration_sec <= chunk_target_sec:
-            # Single-pass for audio under 5 minutes
             audio_16k = self._resample_to_16k(waveform, sampling_rate)
             segments, _ = model.transcribe(
                 audio_16k,
@@ -156,14 +177,15 @@ class WhisperXSlicer(BaseSlicer):
                         type("Word", (), {"start": seg.start, "end": seg.end, "word": seg.text})()
                     )
         else:
-            # Multi-chunk streaming pass with silence zero-crossing boundary detection
             chunk_target_samples = int(chunk_target_sec * sampling_rate)
             search_radius_samples = int(15.0 * sampling_rate)
 
             split_indices = [0]
             cur_idx = chunk_target_samples
             while cur_idx < total_samples:
-                clean_split = self._find_chunk_split_index(waveform, cur_idx, search_radius_samples)
+                clean_split = self._find_chunk_split_index(
+                    waveform, cur_idx, search_radius_samples, sampling_rate
+                )
                 split_indices.append(clean_split)
                 cur_idx = clean_split + chunk_target_samples
             split_indices.append(total_samples)
@@ -207,14 +229,17 @@ class WhisperXSlicer(BaseSlicer):
                 import gc
                 gc.collect()
 
-        if not all_words:
-            return [(0, len(waveform))]
+        return all_words
 
-        # Sentence punctuation marks for Japanese and Latin
+    def _group_words_into_sentences(self, all_words: List[Any]) -> List[Tuple[float, float]]:
+        """Group word timestamps into semantic clauses using Japanese/Latin punctuation rules."""
+        if not all_words:
+            return []
+
         sentence_end_punct = set(["。", "！", "？", "!", "?", "…", "\n"])
         clause_punct = set(["、", ",", ";"])
 
-        sentences: List[Dict[str, Any]] = []
+        sentences: List[Tuple[float, float]] = []
         cur_sentence_words = []
 
         max_dur_sec = self.max_length_ms / 1000.0
@@ -227,16 +252,10 @@ class WhisperXSlicer(BaseSlicer):
             is_end_punct = any(p in w_text for p in sentence_end_punct)
             is_clause_punct = any(p in w_text for p in clause_punct)
 
-            # Check gap to next word
             has_next = (i + 1) < len(all_words)
             gap_to_next = (all_words[i + 1].start - w.end) if has_next else 999.0
             cur_duration = cur_sentence_words[-1].end - cur_sentence_words[0].start
 
-            # Conditions to cut into a sentence:
-            # 1. End punctuation (。)
-            # 2. Pause (>= min_sil_sec) when minimum sentence length reached
-            # 3. Clause mark (、) when sentence duration reaches 75% of max
-            # 4. Exceeds max duration
             should_cut = False
             if is_end_punct:
                 should_cut = True
@@ -248,24 +267,30 @@ class WhisperXSlicer(BaseSlicer):
                 should_cut = True
 
             if should_cut:
-                s_time = cur_sentence_words[0].start
-                e_time = cur_sentence_words[-1].end
-                sentences.append({"start": s_time, "end": e_time})
+                sentences.append((cur_sentence_words[0].start, cur_sentence_words[-1].end))
                 cur_sentence_words = []
 
         if cur_sentence_words:
-            s_time = cur_sentence_words[0].start
-            e_time = cur_sentence_words[-1].end
-            sentences.append({"start": s_time, "end": e_time})
+            sentences.append((cur_sentence_words[0].start, cur_sentence_words[-1].end))
+
+        return sentences
+
+    def slice(self, waveform: np.ndarray, sampling_rate: int) -> List[Tuple[int, int]]:
+        """Slice audio according to semantic punctuation boundaries with zero-crossing snapping."""
+        all_words = self._extract_words(waveform, sampling_rate)
+        if not all_words:
+            return [(0, len(waveform))]
+
+        sentences = self._group_words_into_sentences(all_words)
 
         # Apply padding and enforce zero-overlap between adjacent sentences
         pad_sec = self.max_sil_kept_ms / 1000.0
         total_audio_sec = len(waveform) / sampling_rate
 
         raw_ranges = []
-        for item in sentences:
-            s_pad = max(0.0, item["start"] - pad_sec)
-            e_pad = min(total_audio_sec, item["end"] + pad_sec)
+        for s_t, e_t in sentences:
+            s_pad = max(0.0, s_t - pad_sec)
+            e_pad = min(total_audio_sec, e_t + pad_sec)
             raw_ranges.append((s_pad, e_pad))
 
         # Collision resolution at midpoint

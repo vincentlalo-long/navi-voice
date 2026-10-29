@@ -12,6 +12,7 @@ Architecture:
 
 import argparse
 import csv
+import gc
 import json
 import os
 import sys
@@ -28,14 +29,14 @@ VOICE_ROOT = SCRIPT_DIR.parent
 if str(VOICE_ROOT) not in sys.path:
     sys.path.insert(0, str(VOICE_ROOT))
 
-from modules.audio_utils import (
+from modules.audio import (
     apply_raised_cosine_fade,
     compute_audio_stats,
     compute_edge_metrics,
-    evaluate_boundary_quality,
     normalize_peak,
+    normalize_loudness_ebur128,
 )
-from modules.classifier import CategoryClassifier
+from modules.tagging import CategoryClassifier
 from modules.slicers import get_slicer
 
 
@@ -133,8 +134,15 @@ def main():
         "--slicer",
         type=str,
         default=None,
-        choices=["energy", "silero", "webrtc", "whisper", "whisperx"],
-        help="Choose slicing algorithm: 'energy', 'silero', 'webrtc', or 'whisper' (semantic)",
+        choices=["energy", "silero", "webrtc", "whisper", "whisperx", "hybrid"],
+        help="Choose slicing algorithm: 'energy', 'silero', 'webrtc', 'whisper', or 'hybrid'",
+    )
+    parser.add_argument(
+        "--norm-method",
+        type=str,
+        default=None,
+        choices=["peak", "ebu_r128"],
+        help="Loudness normalization method: 'peak' (default) or 'ebu_r128' (-20 LUFS)",
     )
     parser.add_argument(
         "--sample-seconds",
@@ -191,16 +199,7 @@ def main():
     sampling_rate = int(audio_cfg.get("sample_rate", 44100))
     target_peak_db = float(audio_cfg.get("target_peak_db", -1.0))
 
-    # Slicer Strategy Resolution
-    slicer_method = args.slicer or audio_cfg.get("slicer_method", "energy")
-    slicer = get_slicer(slicer_method, audio_cfg)
-
-    # Separate output directory per slicer algorithm for clean, un-overwritten A/B benchmarking
-    slicer_output_dir = output_dir / slicer_method
-    slices_dir = slicer_output_dir / slices_subfolder
-    slices_dir.mkdir(parents=True, exist_ok=True)
-
-    # ASR parameters
+    # ASR parameters (resolved before Slicer initialization to inject device & model_size)
     asr_cfg = config.get("asr", {})
     model_size = args.model_size or asr_cfg.get("model_size", "large-v3")
     device = args.device or asr_cfg.get("device", "cuda")
@@ -212,6 +211,22 @@ def main():
     compute_type = asr_cfg.get("compute_type", "float16")
     language = asr_cfg.get("language", "ja")
     beam_size = int(asr_cfg.get("beam_size", 5))
+
+    # Slicer Strategy Resolution (injecting device and ASR params for neural/semantic slicers)
+    slicer_method = args.slicer or audio_cfg.get("slicer_method", "energy")
+    slicer_cfg = audio_cfg.copy()
+    slicer_cfg.update({
+        "device": device,
+        "model_size": model_size,
+        "compute_type": compute_type,
+        "language": language,
+    })
+    slicer = get_slicer(slicer_method, slicer_cfg)
+
+    # Separate output directory per slicer algorithm for clean, un-overwritten A/B benchmarking
+    slicer_output_dir = output_dir / slicer_method
+    slices_dir = slicer_output_dir / slices_subfolder
+    slices_dir.mkdir(parents=True, exist_ok=True)
 
     # Semantic / Emotion Classifier
     classifier = CategoryClassifier(config.get("emotion_rules", {}))
@@ -271,10 +286,19 @@ def main():
             chunks = slicer.slice(data, sampling_rate)
             print(f"    -> Extracted {len(chunks)} valid dialogue slices.")
 
+            effective_norm = args.norm_method or audio_cfg.get("normalization_method", "peak")
+            if effective_norm not in ("peak", "ebu_r128"):
+                print(f"    [!] Warning: Unknown normalization method '{effective_norm}'. Falling back to 'peak'.")
+                effective_norm = "peak"
+            target_lufs = float(audio_cfg.get("target_lufs", -20.0))
+
             for start_idx, end_idx in tqdm(chunks, desc=f"    Writing {raw_path.stem}"):
                 chunk_audio = data[start_idx:end_idx]
                 faded_audio = apply_raised_cosine_fade(chunk_audio, sampling_rate, fade_ms=5.0)
-                norm_audio = normalize_peak(faded_audio, target_peak_db=target_peak_db, max_gain_db=18.0)
+                if effective_norm == "ebu_r128":
+                    norm_audio = normalize_loudness_ebur128(faded_audio, sampling_rate, target_lufs=target_lufs, max_gain_db=18.0)
+                else:
+                    norm_audio = normalize_peak(faded_audio, target_peak_db=target_peak_db, max_gain_db=18.0)
 
                 slice_filename = f"{file_prefix}_{global_slice_idx:05d}.wav"
                 slice_path = slices_dir / slice_filename
@@ -325,6 +349,16 @@ def main():
 
     print(f"\n[+] Total dialogue slices prepared: {len(metadata_records)}")
 
+    # Release the slicer model and full waveform before loading ASR. Without this,
+    # whisper/hybrid keeps a Whisper model alive while a second ASR model loads,
+    # and the full source waveform (~2 GB for a 3-hour 44.1 kHz file) stays in RAM.
+    if not args.skip_slicing:
+        data = None
+        chunks = None
+    slicer.release()
+    slicer = None
+    gc.collect()
+
     # --------------------------------------------------------------------------
     # STEP 3 & 4: WHISPER ASR & CATEGORY MINING
     # --------------------------------------------------------------------------
@@ -371,6 +405,17 @@ def main():
             cps = len(transcription) / (item["duration_sec"] + 1e-6)
             item["chars_per_sec"] = round(cps, 2)
             item["category"] = classifier.classify(transcription, item)
+
+        del segments
+        del model
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
     # --------------------------------------------------------------------------
     # STEP 5: EXPORT METADATA & DATASET LISTS
