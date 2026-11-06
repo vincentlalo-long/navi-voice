@@ -324,6 +324,16 @@ def main():
                     "category": "",
                 })
                 global_slice_idx += 1
+
+        # Idempotency: remove slice files left behind by a previous run so the
+        # folder always matches the metadata written for this run. Only done when
+        # slicing actually ran -- --skip-slicing reads the folder as its input.
+        written_filenames = {record["filename"] for record in metadata_records}
+        stale_slices = [p for p in slices_dir.glob("*.wav") if p.name not in written_filenames]
+        for stale_path in stale_slices:
+            stale_path.unlink()
+        if stale_slices:
+            print(f"    [i] Removed {len(stale_slices)} stale slice file(s) from a previous run.")
     else:
         print("\n[i] Slicing skipped (--skip-slicing). Reading existing slices...")
         existing_slices = sorted(list(slices_dir.glob("*.wav")))
@@ -334,12 +344,14 @@ def main():
             metadata_records.append({
                 "id": idx,
                 "filename": s_path.name,
-                "relative_path": f"{slices_subfolder}/{s_path.name}",
+                "relative_path": f"{slicer_method}/{slices_subfolder}/{s_path.name}",
                 "absolute_path": str(s_path),
                 "source_file": "existing",
-                "start_time_sec": 0,
-                "end_time_sec": stats["duration_sec"],
-                "slicer_method": "existing",
+                # Source offsets cannot be recovered from a file already on disk;
+                # unknown is honest, zero would imply the slice starts at 0.000s.
+                "start_time_sec": None,
+                "end_time_sec": None,
+                "slicer_method": slicer_method,
                 **stats,
                 **edge_metrics,
                 "text": "",

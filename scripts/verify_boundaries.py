@@ -6,7 +6,7 @@ Mathematically inspects audio slices to verify whether dialogue cuts occurred
 smoothly inside silence intervals or accidentally clipped active speech phonemes.
 
 Metrics evaluated per slice:
-1. Edge Start RMS (dB): Energy in the first 25ms. Clean cuts must be < -30 dB.
+1. Edge Start RMS (dB): Energy in the first 25ms. Clean cuts are <= -35 dB (CLEAN) or <= -27 dB (SAFE).
 2. Edge End RMS (dB): Energy in the last 25ms.
 3. Edge Energy Ratio (EER): Ratio of edge energy to core utterance energy.
 4. Transient Step Jump: First sample amplitude |x[0]| (checks for click artifacts).

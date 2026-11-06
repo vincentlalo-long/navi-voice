@@ -16,7 +16,7 @@ def plot_benchmark_comparison_png(
     """
     Renders a 2x2 multi-panel comparison figure visualizing:
     1. Boundary Quality (CBR % vs WARN %)
-    2. Segmentation Efficiency (Speech Coverage % vs Slices Count)
+    2. Segmentation Efficiency (Retained Audio % vs Slice Count)
     3. Utterance Duration Profiles (Mean, Median, P95)
     4. Execution Speed (RTF - Real-Time Factor on log scale)
     """
@@ -65,12 +65,12 @@ def plot_benchmark_comparison_png(
 
     # 2. Segmentation Efficiency (Coverage % & Slice Count)
     ax2 = axes[0, 1]
-    coverage_vals = [results[k]["segmentation"]["speech_coverage_pct"] for k in results]
+    coverage_vals = [results[k]["segmentation"]["audio_coverage_pct"] for k in results]
     slice_counts = [results[k]["segmentation"]["total_slices"] for k in results]
 
-    bars_cov = ax2.bar(x, coverage_vals, width=0.5, color="#3b82f6", alpha=0.85, label="Speech Coverage %")
-    ax2.set_title("2. Speech Coverage & Dialogue Slices", fontsize=12, fontweight="bold", pad=10)
-    ax2.set_ylabel("Preserved Audio (%)")
+    bars_cov = ax2.bar(x, coverage_vals, width=0.5, color="#3b82f6", alpha=0.85, label="Retained Audio %")
+    ax2.set_title("2. Retained Audio & Dialogue Slice Count", fontsize=12, fontweight="bold", pad=10)
+    ax2.set_ylabel("Retained Audio (%)")
     ax2.set_xticks(x)
     ax2.set_xticklabels(algorithms, fontweight="bold")
     ax2.set_ylim(0, 115)

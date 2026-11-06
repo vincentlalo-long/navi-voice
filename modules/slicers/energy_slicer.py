@@ -4,7 +4,7 @@ Energy-based Short-Time RMS Audio Slicer (DSP Strategy).
 
 from typing import Any, Dict, List, Tuple
 import numpy as np
-from .base import BaseSlicer
+from .base import BaseSlicer, merge_short_segments
 
 
 class EnergySlicer(BaseSlicer):
@@ -184,5 +184,14 @@ class EnergySlicer(BaseSlicer):
                 final_chunks.append((cur_p, clean_cut))
                 cur_p = clean_cut
             final_chunks.append((cur_p, end))
+
+        # min_length_ms is a target utterance length for TTS: fragments below it are
+        # merged into the next segment when the gap is only a short pause.
+        final_chunks = merge_short_segments(
+            final_chunks,
+            min_length_samples=min_length,
+            max_length_samples=max_length,
+            max_gap_samples=max_sil_kept * 2,
+        )
 
         return final_chunks

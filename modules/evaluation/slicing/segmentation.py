@@ -16,7 +16,7 @@ def compute_segmentation_integrity(
 ) -> Dict[str, Any]:
     """
     Evaluates segmentation integrity across files:
-      - Speech Coverage Ratio (SCR %)
+      - Retained Audio Ratio (total slice duration / total audio duration)
       - Slices per minute
       - Duration statistics (mean, median, p95, min, max)
       - Tail drop rate %
@@ -28,9 +28,9 @@ def compute_segmentation_integrity(
     if not all_chunks:
         return {
             "total_slices": 0,
-            "total_speech_sec": 0.0,
+            "total_sliced_sec": 0.0,
             "total_audio_sec": round(total_audio_sec, 2),
-            "speech_coverage_pct": 0.0,
+            "audio_coverage_pct": 0.0,
             "slices_per_minute": 0.0,
             "mean_duration_sec": 0.0,
             "median_duration_sec": 0.0,
@@ -43,8 +43,10 @@ def compute_segmentation_integrity(
         }
 
     durations_sec = [(e - s) / sampling_rate for s, e in all_chunks]
-    total_speech_sec = sum(durations_sec)
-    coverage_pct = min(100.0, (total_speech_sec / (total_audio_sec + 1e-9)) * 100.0)
+    # Slices are padded with silence, so this ratio says how much of the source file
+    # ended up inside the dataset -- not how much of the actual speech was kept.
+    total_sliced_sec = sum(durations_sec)
+    coverage_pct = min(100.0, (total_sliced_sec / (total_audio_sec + 1e-9)) * 100.0)
     minutes = max(total_audio_sec / 60.0, 1e-3)
     slices_per_min = len(all_chunks) / minutes
 
@@ -64,9 +66,9 @@ def compute_segmentation_integrity(
 
     return {
         "total_slices": len(all_chunks),
-        "total_speech_sec": round(total_speech_sec, 2),
+        "total_sliced_sec": round(total_sliced_sec, 2),
         "total_audio_sec": round(total_audio_sec, 2),
-        "speech_coverage_pct": round(coverage_pct, 1),
+        "audio_coverage_pct": round(coverage_pct, 1),
         "slices_per_minute": round(slices_per_min, 1),
         "mean_duration_sec": round(float(np.mean(durations_sec)), 2),
         "median_duration_sec": round(float(np.median(durations_sec)), 2),

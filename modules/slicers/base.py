@@ -8,6 +8,39 @@ import gc
 import numpy as np
 
 
+def merge_short_segments(
+    chunks: List[Tuple[int, int]],
+    min_length_samples: int,
+    max_length_samples: int,
+    max_gap_samples: int,
+) -> List[Tuple[int, int]]:
+    """Merge segments shorter than ``min_length_samples`` into the next segment.
+
+    A slicer can only be said to honour ``min_length_ms`` if a shorter fragment is
+    still merged when the boundary between the two neighbours is just a short pause
+    rather than a real sentence break. Both the pause length and the resulting
+    segment length are bounded, so merging never bridges a long silence and never
+    creates a segment above ``max_length_ms``.
+    """
+    if not chunks or min_length_samples <= 0:
+        return list(chunks)
+
+    merged: List[Tuple[int, int]] = []
+    for start, end in chunks:
+        if merged:
+            prev_start, prev_end = merged[-1]
+            gap = start - prev_end
+            if (
+                (prev_end - prev_start) < min_length_samples
+                and gap <= max_gap_samples
+                and (end - prev_start) <= max_length_samples
+            ):
+                merged[-1] = (prev_start, end)
+                continue
+        merged.append((start, end))
+    return merged
+
+
 class BaseSlicer(ABC):
     """
     Abstract strategy interface for voice segmentation algorithms.

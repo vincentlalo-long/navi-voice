@@ -5,7 +5,7 @@ WebRTC VAD Audio Slicer Strategy (GMM Baseline).
 from typing import Any, Dict, List, Tuple
 import numpy as np
 import scipy.signal
-from .base import BaseSlicer
+from .base import BaseSlicer, merge_short_segments
 
 
 class WebRTCSlicer(BaseSlicer):
@@ -194,7 +194,6 @@ class WebRTCSlicer(BaseSlicer):
         # Map back to original sampling rate and apply balanced zero-crossing cuts
         ratio = sampling_rate / target_sr
         max_samples = int(sampling_rate * self.max_length_ms / 1000)
-        min_speech_orig = int(sampling_rate * self.min_speech_ms / 1000)
 
         final_chunks: List[Tuple[int, int]] = []
         for s_16k, e_16k in merged:
@@ -222,5 +221,12 @@ class WebRTCSlicer(BaseSlicer):
                 final_chunks.append((cur_p, clean_cut))
                 cur_p = clean_cut
             final_chunks.append((cur_p, end_orig))
+
+        final_chunks = merge_short_segments(
+            final_chunks,
+            min_length_samples=int(sampling_rate * self.min_length_ms / 1000),
+            max_length_samples=max_samples,
+            max_gap_samples=int(sampling_rate * self.max_sil_kept_ms / 1000) * 2,
+        )
 
         return final_chunks

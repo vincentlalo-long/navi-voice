@@ -141,7 +141,7 @@ def compute_edge_metrics(
             "eer_end": 0.0,
             "step_jump": 0.0,
             "status": "TOO_SHORT",
-            "clean_boundary": True,
+            "clean_boundary": False,
         }
 
     start_region = audio[:edge_samples]

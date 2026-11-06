@@ -46,7 +46,9 @@ def evaluate_slice_boundary(
             "eer_end": 0.0,
             "step_jump": round(step_jump, 4),
             "status": "TOO_SHORT",
-            "clean_boundary": True,
+            # A slice shorter than two edge windows is never measured, so it must
+            # not be reported as clean.
+            "clean_boundary": False,
         }
 
     start_reg = audio[:edge_samples]
@@ -112,6 +114,7 @@ def aggregate_boundary_metrics(slice_evaluations: List[Dict[str, Any]]) -> Dict[
             "clean_boundary_rate": 0.0,
             "clean_edge_pct": 0.0,
             "warn_edge_pct": 0.0,
+            "too_short_pct": 0.0,
             "mean_edge_rms_db": 0.0,
             "p95_edge_rms_db": 0.0,
             "mean_eer": 0.0,
@@ -122,12 +125,17 @@ def aggregate_boundary_metrics(slice_evaluations: List[Dict[str, Any]]) -> Dict[
     clean_count = sum(1 for m in slice_evaluations if m.get("status") == "CLEAN")
     safe_count = sum(1 for m in slice_evaluations if m.get("status") == "SAFE")
     warn_count = sum(1 for m in slice_evaluations if m.get("status") == "WARN")
+    too_short_count = sum(1 for m in slice_evaluations if m.get("status") == "TOO_SHORT")
+
+    # TOO_SHORT slices stay in the denominator (so the buckets add up to 100%) but
+    # were never measured, so their placeholder values must not skew the statistics.
+    measured = [m for m in slice_evaluations if m.get("status") != "TOO_SHORT"]
 
     edge_rms_values = []
     eer_values = []
     step_jumps = []
 
-    for m in slice_evaluations:
+    for m in measured:
         edge_rms_values.extend([m.get("start_rms_db", -99.0), m.get("end_rms_db", -99.0)])
         eer_values.extend([m.get("eer_start", 0.0), m.get("eer_end", 0.0)])
         step_jumps.append(m.get("step_jump", 0.0))
@@ -135,6 +143,7 @@ def aggregate_boundary_metrics(slice_evaluations: List[Dict[str, Any]]) -> Dict[
     clean_pct = round((clean_count / total) * 100.0, 1)
     safe_pct = round((safe_count / total) * 100.0, 1)
     warn_pct = round((warn_count / total) * 100.0, 1)
+    too_short_pct = round((too_short_count / total) * 100.0, 1)
     cbr_pct = round(clean_pct + safe_pct, 1)
 
     return {
@@ -146,11 +155,12 @@ def aggregate_boundary_metrics(slice_evaluations: List[Dict[str, Any]]) -> Dict[
         "clean_boundary_rate": cbr_pct,
         "clean_edge_pct": clean_pct,
         "warn_edge_pct": warn_pct,
-        "mean_edge_rms_db": round(float(np.mean(edge_rms_values)), 1),
-        "p95_edge_rms_db": round(float(np.percentile(edge_rms_values, 95)), 1),
-        "mean_eer": round(float(np.mean(eer_values)), 3),
-        "p95_eer": round(float(np.percentile(eer_values, 95)), 3),
-        "max_step_jump": round(float(np.max(step_jumps)), 4),
+        "too_short_pct": too_short_pct,
+        "mean_edge_rms_db": round(float(np.mean(edge_rms_values)), 1) if edge_rms_values else -99.0,
+        "p95_edge_rms_db": round(float(np.percentile(edge_rms_values, 95)), 1) if edge_rms_values else -99.0,
+        "mean_eer": round(float(np.mean(eer_values)), 3) if eer_values else 0.0,
+        "p95_eer": round(float(np.percentile(eer_values, 95)), 3) if eer_values else 0.0,
+        "max_step_jump": round(float(np.max(step_jumps)), 4) if step_jumps else 0.0,
     }
 
 

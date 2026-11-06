@@ -18,6 +18,11 @@ datasets/
 *.mkv
 *.webm
 
+# --- Agent & External Tool State ---
+.agents/
+.freebuff/
+skills-lock.json
+
 # --- Python Virtual Environments ---
 .venv/
 venv/
