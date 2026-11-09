@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import re
 import numpy as np
 import scipy.signal
-from .base import BaseSlicer
+from .base import BaseSlicer, merge_short_segments, validate_intervals
 from .. import cuda_utils  # Ensure CUDA shared libraries are pre-loaded
 
 
@@ -101,22 +101,6 @@ class WhisperXSlicer(BaseSlicer):
         up = target_sr // gcd
         down = sampling_rate // gcd
         return scipy.signal.resample_poly(audio, up, down).astype(np.float32)
-
-    @staticmethod
-    def _find_clean_split_point(waveform: np.ndarray, target_idx: int, window: int) -> int:
-        """Find the zero-crossing sample with minimum amplitude near target_idx."""
-        w_start = max(0, target_idx - window)
-        w_end = min(len(waveform) - 1, target_idx + window)
-        if w_end <= w_start:
-            return target_idx
-
-        sub_wave = waveform[w_start:w_end]
-        sign_changes = np.where(np.diff(np.signbit(sub_wave)))[0]
-        if len(sign_changes) > 0:
-            abs_amps = np.abs(sub_wave[sign_changes])
-            best_idx = sign_changes[np.argmin(abs_amps)]
-            return int(w_start + best_idx)
-        return int(w_start + np.argmin(np.abs(sub_wave)))
 
     def _find_chunk_split_index(
         self,
@@ -244,6 +228,10 @@ class WhisperXSlicer(BaseSlicer):
 
         max_dur_sec = self.max_length_ms / 1000.0
         min_sil_sec = self.min_interval_ms / 1000.0
+        # A gap at least this long is a real utterance break even when the
+        # preceding sentence is still shorter than min_length_ms. Without this
+        # upper bound a short "はい" was glued across an 8-second pause.
+        max_gap_sec = max(2.0 * self.max_sil_kept_ms / 1000.0, min_sil_sec)
 
         for i, w in enumerate(all_words):
             cur_sentence_words.append(w)
@@ -258,6 +246,8 @@ class WhisperXSlicer(BaseSlicer):
 
             should_cut = False
             if is_end_punct:
+                should_cut = True
+            elif gap_to_next >= max_gap_sec:
                 should_cut = True
             elif gap_to_next >= min_sil_sec and cur_duration >= (self.min_length_ms / 1000.0):
                 should_cut = True
@@ -277,15 +267,22 @@ class WhisperXSlicer(BaseSlicer):
 
     def slice(self, waveform: np.ndarray, sampling_rate: int) -> List[Tuple[int, int]]:
         """Slice audio according to semantic punctuation boundaries with zero-crossing snapping."""
+        total = len(waveform)
+        if total == 0:
+            return []
+
         all_words = self._extract_words(waveform, sampling_rate)
         if not all_words:
-            return [(0, len(waveform))]
+            # No detected speech is not a reason to emit the whole recording.
+            return []
 
         sentences = self._group_words_into_sentences(all_words)
+        if not sentences:
+            return []
 
         # Apply padding and enforce zero-overlap between adjacent sentences
         pad_sec = self.max_sil_kept_ms / 1000.0
-        total_audio_sec = len(waveform) / sampling_rate
+        total_audio_sec = total / sampling_rate
 
         raw_ranges = []
         for s_t, e_t in sentences:
@@ -307,34 +304,40 @@ class WhisperXSlicer(BaseSlicer):
                 s = mid
             resolved_ranges.append((s, e))
 
-        # Convert to sample indices and apply balanced zero-crossing cuts
         max_samples = int(sampling_rate * self.max_length_ms / 1000)
-        min_speech_samples = int(sampling_rate * self.min_speech_ms / 1000)
-
         final_chunks: List[Tuple[int, int]] = []
+
         for s_sec, e_sec in resolved_ranges:
-            s_idx = int(s_sec * sampling_rate)
-            e_idx = min(len(waveform), int(e_sec * sampling_rate))
-            chunk_len = e_idx - s_idx
-
-            if chunk_len < min_speech_samples:
+            s_idx = max(0, min(total, int(s_sec * sampling_rate)))
+            e_idx = max(0, min(total, int(e_sec * sampling_rate)))
+            if e_idx <= s_idx:
                 continue
 
-            if chunk_len <= max_samples:
-                final_chunks.append((s_idx, e_idx))
-                continue
+            final_chunks.extend(
+                self.balanced_subdivide(
+                    waveform,
+                    sampling_rate,
+                    s_idx,
+                    e_idx,
+                    max_samples,
+                    lambda lo, hi: self.find_clean_split_in_range(waveform, lo, hi),
+                )
+            )
 
-            # Balanced k-way split
-            num_splits = int(np.ceil(chunk_len / max_samples))
-            ideal_len = chunk_len // num_splits
-            cur_p = s_idx
-            search_win = int(sampling_rate * 0.5)
+        final_chunks = merge_short_segments(
+            final_chunks,
+            min_length_samples=int(sampling_rate * self.min_length_ms / 1000),
+            max_length_samples=max_samples,
+            max_gap_samples=int(sampling_rate * self.max_sil_kept_ms / 1000) * 2,
+        )
 
-            for idx in range(1, num_splits):
-                target_p = s_idx + idx * ideal_len
-                clean_cut = self._find_clean_split_point(waveform, target_p, search_win)
-                final_chunks.append((cur_p, clean_cut))
-                cur_p = clean_cut
-            final_chunks.append((cur_p, e_idx))
+        # Keep short exclamations; only drop sub-200 ms clicks.
+        keep_floor = max(1, int(sampling_rate * 0.2))
+        final_chunks = [(s, e) for s, e in final_chunks if e - s >= keep_floor]
 
-        return final_chunks
+        return validate_intervals(
+            final_chunks,
+            total_samples=total,
+            sampling_rate=sampling_rate,
+            max_length_samples=max_samples,
+        )

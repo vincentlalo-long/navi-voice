@@ -5,7 +5,7 @@ WebRTC VAD Audio Slicer Strategy (GMM Baseline).
 from typing import Any, Dict, List, Tuple
 import numpy as np
 import scipy.signal
-from .base import BaseSlicer, merge_short_segments
+from .base import BaseSlicer, merge_short_segments, validate_intervals
 
 
 class WebRTCSlicer(BaseSlicer):
@@ -59,7 +59,9 @@ class WebRTCSlicer(BaseSlicer):
             min_length_ms=int(config.get("min_length_ms", 2000)),
             max_length_ms=int(config.get("max_length_ms", 12000)),
             min_interval_ms=int(config.get("min_interval_ms", 400)),
-            hop_size_ms=int(config.get("hop_size_ms", 20)),
+            # The shared audio config uses 10 ms for the energy RMS hop. That
+            # value is not a WebRTC default; keep an explicit override.
+            hop_size_ms=int(config.get("webrtc_hop_size_ms", 20)),
             max_sil_kept_ms=int(config.get("max_sil_kept_ms", 400)),
             min_speech_ms=int(config.get("min_speech_ms", 800)),
         )
@@ -76,24 +78,11 @@ class WebRTCSlicer(BaseSlicer):
                 )
         return self._vad
 
-    @staticmethod
-    def _find_clean_split_point(waveform: np.ndarray, target_idx: int, window: int) -> int:
-        """Find the zero-crossing sample with minimum amplitude near target_idx."""
-        w_start = max(0, target_idx - window)
-        w_end = min(len(waveform) - 1, target_idx + window)
-        if w_end <= w_start:
-            return target_idx
-
-        sub_wave = waveform[w_start:w_end]
-        sign_changes = np.where(np.diff(np.signbit(sub_wave)))[0]
-        if len(sign_changes) > 0:
-            abs_amps = np.abs(sub_wave[sign_changes])
-            best_idx = sign_changes[np.argmin(abs_amps)]
-            return int(w_start + best_idx)
-        return int(w_start + np.argmin(np.abs(sub_wave)))
-
     def slice(self, waveform: np.ndarray, sampling_rate: int) -> List[Tuple[int, int]]:
         """Slice waveform using WebRTC VAD frame decisions and smoothed windowing."""
+        if len(waveform) == 0:
+            return []
+
         vad = self._get_vad()
 
         # WebRTC VAD requires 8000, 16000, 32000, or 48000 Hz 16-bit PCM
@@ -112,7 +101,7 @@ class WebRTCSlicer(BaseSlicer):
         num_frames = len(int16_audio) // frame_samples
 
         if num_frames == 0:
-            return [(0, len(waveform))]
+            return []
 
         # Classify each frame
         frame_flags = []
@@ -158,69 +147,62 @@ class WebRTCSlicer(BaseSlicer):
         if not speech_intervals:
             return []
 
-        # Merge intervals separated by small pauses (< min_interval_ms)
         min_sil_samples = int(target_sr * self.min_interval_ms / 1000)
         pad_samples = int(target_sr * self.max_sil_kept_ms / 1000)
         max_samples_16k = int(target_sr * self.max_length_ms / 1000)
         min_speech_16k = int(target_sr * self.min_speech_ms / 1000)
 
-        padded_intervals = []
+        # Merge raw speech intervals first. Padding is applied afterwards, so a
+        # 1.2 s pause is not mistaken for a 0.4 s one after both sides are padded.
+        merged_raw = []
         for s, e in speech_intervals:
-            s_pad = max(0, s - pad_samples)
-            e_pad = min(len(resampled), e + pad_samples)
-            padded_intervals.append((s_pad, e_pad))
+            if merged_raw:
+                prev_s, prev_e = merged_raw[-1]
+                if s - prev_e <= min_sil_samples and e - prev_s <= max_samples_16k:
+                    merged_raw[-1] = (prev_s, e)
+                    continue
+            merged_raw.append((s, e))
 
-        # Collision resolution & merging
-        merged = []
+        padded_intervals = [
+            (max(0, s - pad_samples), min(len(resampled), e + pad_samples))
+            for s, e in merged_raw
+        ]
+
+        # Collision resolution without forced merging.
+        resolved = []
         for s, e in padded_intervals:
-            if not merged:
-                merged.append((s, e))
-                continue
-
-            prev_s, prev_e = merged[-1]
-            gap = s - prev_e
-            combined_len = e - prev_s
-
-            if gap <= min_sil_samples and combined_len <= max_samples_16k:
-                merged[-1] = (prev_s, e)
-            else:
-                if s < prev_e:
-                    # Enforce zero-overlap midpoint split on padding collision
-                    mid = (prev_e + s) // 2
-                    merged[-1] = (prev_s, mid)
-                    s = mid
-                merged.append((s, e))
+            if resolved and s < resolved[-1][1]:
+                prev_s, prev_e = resolved[-1]
+                mid = max(prev_s + 1, (prev_e + s) // 2)
+                resolved[-1] = (prev_s, min(mid, prev_e))
+                s = max(s, resolved[-1][1])
+            if e > s:
+                resolved.append((s, e))
 
         # Map back to original sampling rate and apply balanced zero-crossing cuts
         ratio = sampling_rate / target_sr
         max_samples = int(sampling_rate * self.max_length_ms / 1000)
 
         final_chunks: List[Tuple[int, int]] = []
-        for s_16k, e_16k in merged:
-            chunk_len_16k = e_16k - s_16k
-            if chunk_len_16k < min_speech_16k:
+        for s_16k, e_16k in resolved:
+            if (e_16k - s_16k) < min_speech_16k:
                 continue
 
-            start_orig = int(s_16k * ratio)
+            start_orig = max(0, int(s_16k * ratio))
             end_orig = min(len(waveform), int(e_16k * ratio))
-            chunk_dur = end_orig - start_orig
-
-            if chunk_dur <= max_samples:
-                final_chunks.append((start_orig, end_orig))
+            if end_orig <= start_orig:
                 continue
 
-            # Balanced k-way split
-            num_splits = int(np.ceil(chunk_dur / max_samples))
-            ideal_len = chunk_dur // num_splits
-            cur_p = start_orig
-            search_win = int(sampling_rate * 0.5)
-
-            for s_idx in range(1, num_splits):
-                target_p = start_orig + s_idx * ideal_len
-                clean_cut = self._find_clean_split_point(waveform, target_p, search_win)
-                final_chunks.append((cur_p, clean_cut))
-                cur_p = clean_cut
-            final_chunks.append((cur_p, end_orig))
+            final_chunks.extend(
+                self.balanced_subdivide(
+                    waveform,
+                    sampling_rate,
+                    start_orig,
+                    end_orig,
+                    max_samples,
+                    lambda lo, hi: self.find_clean_split_in_range(waveform, lo, hi),
+                )
+            )
 
         final_chunks = merge_short_segments(
             final_chunks,
@@ -229,4 +211,9 @@ class WebRTCSlicer(BaseSlicer):
             max_gap_samples=int(sampling_rate * self.max_sil_kept_ms / 1000) * 2,
         )
 
-        return final_chunks
+        return validate_intervals(
+            final_chunks,
+            total_samples=len(waveform),
+            sampling_rate=sampling_rate,
+            max_length_samples=max_samples,
+        )

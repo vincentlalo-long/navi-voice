@@ -25,11 +25,12 @@ def plot_benchmark_comparison_png(
     import matplotlib.pyplot as plt
     import numpy as np
 
-    algorithms = [name.upper() for name in results.keys()]
-    if not algorithms:
+    keys = [name for name in results.keys() if not str(name).startswith("_")]
+    algorithms = [name.upper() for name in keys]
+    if not keys:
         return
 
-    n_algos = len(algorithms)
+    n_algos = len(keys)
     x = np.arange(n_algos)
     bar_width = 0.35
 
@@ -40,8 +41,8 @@ def plot_benchmark_comparison_png(
 
     # 1. Boundary Quality (CBR % vs WARN %)
     ax1 = axes[0, 0]
-    cbr_vals = [results[k]["boundary"]["cbr_pct"] for k in results]
-    warn_vals = [results[k]["boundary"]["warn_pct"] for k in results]
+    cbr_vals = [results[k]["boundary"]["cbr_pct"] for k in keys]
+    warn_vals = [results[k]["boundary"]["warn_pct"] for k in keys]
 
     bars_cbr = ax1.bar(x - bar_width / 2, cbr_vals, bar_width, label="CBR % (Clean+Safe)", color="#10b981", alpha=0.85)
     bars_warn = ax1.bar(x + bar_width / 2, warn_vals, bar_width, label="WARN % (Speech Clip Risk)", color="#ef4444", alpha=0.85)
@@ -65,12 +66,12 @@ def plot_benchmark_comparison_png(
 
     # 2. Segmentation Efficiency (Coverage % & Slice Count)
     ax2 = axes[0, 1]
-    coverage_vals = [results[k]["segmentation"]["audio_coverage_pct"] for k in results]
-    slice_counts = [results[k]["segmentation"]["total_slices"] for k in results]
+    coverage_vals = [results[k]["segmentation"]["audio_coverage_pct"] for k in keys]
+    slice_counts = [results[k]["segmentation"]["total_slices"] for k in keys]
 
-    bars_cov = ax2.bar(x, coverage_vals, width=0.5, color="#3b82f6", alpha=0.85, label="Retained Audio %")
-    ax2.set_title("2. Retained Audio & Dialogue Slice Count", fontsize=12, fontweight="bold", pad=10)
-    ax2.set_ylabel("Retained Audio (%)")
+    bars_cov = ax2.bar(x, coverage_vals, width=0.5, color="#3b82f6", alpha=0.85, label="Audio Coverage % (incl. silence)")
+    ax2.set_title("2. Audio Coverage & Dialogue Slice Count", fontsize=12, fontweight="bold", pad=10)
+    ax2.set_ylabel("Audio Coverage (%)")
     ax2.set_xticks(x)
     ax2.set_xticklabels(algorithms, fontweight="bold")
     ax2.set_ylim(0, 115)
@@ -94,9 +95,9 @@ def plot_benchmark_comparison_png(
 
     # 3. Duration Profiles (Mean, Median, P95)
     ax3 = axes[1, 0]
-    mean_durs = [results[k]["segmentation"]["mean_duration_sec"] for k in results]
-    median_durs = [results[k]["segmentation"]["median_duration_sec"] for k in results]
-    p95_durs = [results[k]["segmentation"]["p95_duration_sec"] for k in results]
+    mean_durs = [results[k]["segmentation"]["mean_duration_sec"] for k in keys]
+    median_durs = [results[k]["segmentation"]["median_duration_sec"] for k in keys]
+    p95_durs = [results[k]["segmentation"]["p95_duration_sec"] for k in keys]
 
     w3 = 0.25
     b_mean = ax3.bar(x - w3, mean_durs, w3, label="Mean Dur (s)", color="#6366f1", alpha=0.85)
@@ -127,7 +128,7 @@ def plot_benchmark_comparison_png(
 
     # 4. Execution Speed (RTF)
     ax4 = axes[1, 1]
-    rtf_vals = [results[k]["rtf"] for k in results]
+    rtf_vals = [results[k]["rtf"] for k in keys]
     bar_colors = [palette[i % len(palette)] for i in range(n_algos)]
 
     bars_rtf = ax4.bar(x, rtf_vals, width=0.45, color=bar_colors, alpha=0.85)
@@ -135,8 +136,9 @@ def plot_benchmark_comparison_png(
     ax4.set_ylabel("RTF (Proc Sec / Audio Sec)")
     ax4.set_xticks(x)
     ax4.set_xticklabels(algorithms, fontweight="bold")
-    max_rtf = max(rtf_vals) if rtf_vals else 0.5
-    ax4.set_ylim(0, max(max_rtf * 1.35, 1.15))
+    positive_rtf = [v for v in rtf_vals if v > 0] or [1e-9]
+    ax4.set_yscale("log")
+    ax4.set_ylim(min(positive_rtf) * 0.5, max(max(positive_rtf) * 2.5, 1.15))
     ax4.grid(axis="y", linestyle="--", alpha=0.4)
     ax4.axhline(1.0, color="#ef4444", linestyle=":", linewidth=1.5, label="Realtime Barrier (RTF=1.0)")
     ax4.legend(loc="upper right", framealpha=0.9)
@@ -167,11 +169,12 @@ def plot_boundary_acoustic_detail_png(
     import matplotlib.pyplot as plt
     import numpy as np
 
-    algorithms = list(results.keys())
-    if not algorithms:
+    keys = [name for name in results.keys() if not str(name).startswith("_")]
+    algorithms = list(keys)
+    if not keys:
         return
 
-    n_algos = len(algorithms)
+    n_algos = len(keys)
     x = np.arange(n_algos)
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5.5))
@@ -181,7 +184,7 @@ def plot_boundary_acoustic_detail_png(
     ax1 = axes[0]
     box_data = []
     box_labels = []
-    for k in algorithms:
+    for k in keys:
         # Combine start and end rms list if available, else fallback to avg
         start_list = results[k].get("start_rms_list", [])
         end_list = results[k].get("end_rms_list", [])
@@ -206,9 +209,9 @@ def plot_boundary_acoustic_detail_png(
 
     # Subplot 2: Stacked Boundary Classification (Clean / Safe / Warn)
     ax2 = axes[1]
-    clean_pcts = np.array([results[k]["boundary"]["clean_pct"] for k in algorithms])
-    safe_pcts = np.array([results[k]["boundary"]["safe_pct"] for k in algorithms])
-    warn_pcts = np.array([results[k]["boundary"]["warn_pct"] for k in algorithms])
+    clean_pcts = np.array([results[k]["boundary"]["clean_pct"] for k in keys])
+    safe_pcts = np.array([results[k]["boundary"]["safe_pct"] for k in keys])
+    warn_pcts = np.array([results[k]["boundary"]["warn_pct"] for k in keys])
 
     p1 = ax2.bar(x, clean_pcts, width=0.45, label="CLEAN (Silence Edge)", color="#10b981", alpha=0.85)
     p2 = ax2.bar(x, safe_pcts, width=0.45, bottom=clean_pcts, label="SAFE (Margin Buffer)", color="#f59e0b", alpha=0.85)
@@ -230,7 +233,7 @@ def plot_boundary_acoustic_detail_png(
 
     # Subplot 3: Max Transient Step Jump |x[0]| (Click Gibbs Artifacts)
     ax3 = axes[2]
-    step_jumps = [results[k]["boundary"].get("max_step_jump", 0.0) for k in algorithms]
+    step_jumps = [results[k]["boundary"].get("max_step_jump", 0.0) for k in keys]
     colors = ["#10b981" if s <= 0.05 else "#ef4444" for s in step_jumps]
 
     bars_jump = ax3.bar(x, step_jumps, width=0.45, color=colors, alpha=0.85)
@@ -269,11 +272,12 @@ def plot_duration_distribution_png(
     import matplotlib.pyplot as plt
     import numpy as np
 
-    algorithms = list(results.keys())
-    if not algorithms:
+    keys = [name for name in results.keys() if not str(name).startswith("_")]
+    algorithms = list(keys)
+    if not keys:
         return
 
-    n_algos = len(algorithms)
+    n_algos = len(keys)
     x = np.arange(n_algos)
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
@@ -286,7 +290,7 @@ def plot_duration_distribution_png(
     under_2s_rates = []
     over_10s_rates = []
 
-    for k in algorithms:
+    for k in keys:
         durs = results[k].get("durations", [])
         if not durs:
             # Fallback synth

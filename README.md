@@ -138,7 +138,13 @@ To normalize to broadcast-standard -20 LUFS integrated loudness (via ITU-R BS.17
 .venv/bin/python scripts/voice_dataset_miner.py --sample-seconds 60 --slicer silero
 ```
 
-Generated slices and metadata (`metadata.json`, `metadata.csv`, `dataset.list`) are stored in isolated directories under `datasets/processed/<slicer>/`.
+Generated slices and metadata (`metadata.json`, `metadata.csv`, `dataset.list`) are stored in isolated directories under `datasets/processed/<slicer>/`. When `--profile` is used, the run is isolated further under `datasets/processed/<slicer>/<profile>/`, so two characters cannot overwrite or clean each other's slices.
+
+**6. Resume / Retag Existing Slices:**
+```bash
+.venv/bin/python scripts/voice_dataset_miner.py --slicer hybrid --skip-slicing --skip-transcribe
+```
+This reads the existing manifest instead of rebuilding it from WAV names, preserving `source_file`, source offsets, transcripts, categories and pre-normalization gain telemetry. Raw audio is not required.
 
 ---
 
@@ -149,7 +155,7 @@ The end-to-end speech corpus construction pipeline consists of 4 decoupled, modu
 | Phase | Description | Status | Primary Deliverables |
 | :--- | :--- | :---: | :--- |
 | **Phase 1: Ingest & Collection** | Raw audio ingest, speaker/language metadata, and format verification. | **Complete** | Continuous dialogue corpus ingest (12,301s / 3.42h). |
-| **Phase 2: Audio Slicing & Boundary Segmentation** | Multi-algorithm segmentation (`energy`, `silero`, `webrtc`, `whisper`, `hybrid`), zero-crossing snapping, raised-cosine fading, and loudness normalization. | **Complete** | 5 slicer algorithms, automated benchmark suite, [slice.pdf](docs/slice.pdf), and [benchmark_report.md](reports/benchmarks/benchmark_report.md). |
+| **Phase 2: Audio Slicing & Boundary Segmentation** | Multi-algorithm segmentation (`energy`, `silero`, `webrtc`, `whisper`, `hybrid`), zero-crossing snapping, raised-cosine fading, and loudness normalization. | **Complete** (hardened 2026-11-09) | 5 slicer algorithms, automated benchmark suite, [slice.pdf](docs/slice.pdf), and [benchmark_report.md](reports/benchmarks/benchmark_report.md). |
 | **Phase 3: Semantic Tagging & ASR Transcription** | Faster-Whisper ASR transcription, emotion/prosody classification, and dataset manifest export. | *In Progress* | Emotion/prosody classifier, Whisper transcription pipeline, dataset packaging. |
 | **Phase 4: Acoustic Modeling & Downstream Synthesis Evaluation** | TTS model training (GPT-SoVITS, CosyVoice, VITS) and speech quality evaluation (MOS, SECS, CER/WER, MCD). | *Planned* | Downstream evaluation module (`modules/evaluation/tts`). |
 
@@ -159,13 +165,16 @@ The end-to-end speech corpus construction pipeline consists of 4 decoupled, modu
 
 The 5 slicing algorithms were benchmarked across 3.42 hours (12,301s) of continuous dialogue audio:
 
-| Slicer Algorithm | CBR % (Clean+Safe) | Retained Audio % | Golden Range [2s–10s] % | Slicing RTF | Processing Speedup | Primary Recommendation |
+| Slicer Algorithm | CBR % (Clean+Safe) | Audio Coverage % (incl. silence) | Golden Range [2s–10s] % | Slicing RTF | Processing Speedup | Primary Recommendation |
 | :--- | :---: | :---: | :---: | :---: | :---: | :--- |
-| **`hybrid`** | **89.8%** | **99.9%** | **86.7%** | **0.0224** | **45× faster** | 🏆 **Primary for TTS Training** (Semantic clause alignment, no clipped phonemes) |
-| **`energy`** | **99.5%** | **93.7%** | **94.4%** | **0.0014** | **699× faster** | ⚡ **Secondary for Bulk Mining** (Ultra-fast CPU SIMD, clean silent cuts) |
-| **`silero`** | 96.2% | 96.8% | 60.1% | 0.0166 | 60× faster | General VAD (High run-on rate 34.9% > 10s risk for TTS attention) |
-| **`whisper`** | 77.4% | 96.2% | 84.4% | 0.0225 | 45× faster | Semantic baseline (Acoustic edges require micro-refinement) |
-| **`webrtc`** | 62.6% | 97.7% | 35.4% | 0.0011 | 885× faster | ⚠️ Disqualified for TTS (High 37.5% clipping warning on unvoiced consonants) |
+| **`energy`** | **99.3%** | **96.6%** | **95.6%** | **0.00138** | **725× faster** | 🏆 **Primary for TTS Training** (Clean silent cuts, best duration suitability) |
+| **`hybrid`** | 88.1% | 92.1% | 92.9% | 0.02592 | 39× faster | Semantic option (Clause alignment, but lower coverage/CBR than Energy) |
+| **`silero`** | 97.5% | 96.9% | 89.8% | 0.01966 | 51× faster | Strong neural VAD (High CBR, 9.3% run-on > 10s) |
+| **`whisper`** | 78.4% | 94.2% | 94.6% | 0.02970 | 34× faster | Semantic baseline (Good durations, edges require DSP refinement) |
+| **`webrtc`** | 88.8% | 98.3% | 88.0% | 0.00107 | 935× faster | ⚡ **Fastest CPU baseline** (11.2% WARN, use with downstream QC) |
+
+> [!NOTE]
+> These numbers are from the hardened Phase 2.1 run (2026-11-09). The earlier Silero/WebRTC run-on rates were inflated because their VAD intervals were merged *after* padding (~1.2s effective pause); the fix merges raw intervals first, then pads. Hybrid now drops long inter-sentence silences instead of retaining them as dead clips, so coverage is lower and no longer overstates speech preservation.
 
 > [!TIP]
 > **Detailed Benchmark Report & Visual Charts:**  

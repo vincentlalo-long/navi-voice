@@ -154,7 +154,13 @@ def main():
         "--model-size",
         type=str,
         default=None,
-        help="Override Whisper model size (e.g. large-v3, large-v3-turbo, medium)",
+        help="Override ASR Whisper model size (e.g. large-v3, large-v3-turbo, medium)",
+    )
+    parser.add_argument(
+        "--slicer-model-size",
+        type=str,
+        default=None,
+        help="Whisper model size used only for semantic slicing (default: audio.whisper_model_size or 'base')",
     )
     parser.add_argument(
         "--device",
@@ -214,17 +220,28 @@ def main():
 
     # Slicer Strategy Resolution (injecting device and ASR params for neural/semantic slicers)
     slicer_method = args.slicer or audio_cfg.get("slicer_method", "energy")
+    # Slicing and transcription can use different Whisper sizes: the slicer
+    # only needs word timings, while Phase 3 needs the strongest ASR model.
+    slicer_model_size = args.slicer_model_size or audio_cfg.get("whisper_model_size", "base")
     slicer_cfg = audio_cfg.copy()
     slicer_cfg.update({
         "device": device,
-        "model_size": model_size,
+        "model_size": slicer_model_size,
         "compute_type": compute_type,
         "language": language,
     })
     slicer = get_slicer(slicer_method, slicer_cfg)
 
-    # Separate output directory per slicer algorithm for clean, un-overwritten A/B benchmarking
+    # Isolate runs by profile/speaker so two profiles can no longer overwrite
+    # or clean each other's slices. The no-profile layout stays backwards
+    # compatible: datasets/processed/<slicer>/slices.
+    profile_tag = ""
+    if args.profile:
+        profile_tag = Path(args.profile).stem
+        profile_tag = "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in profile_tag)
     slicer_output_dir = output_dir / slicer_method
+    if profile_tag:
+        slicer_output_dir = slicer_output_dir / profile_tag
     slices_dir = slicer_output_dir / slices_subfolder
     slices_dir.mkdir(parents=True, exist_ok=True)
 
@@ -242,17 +259,15 @@ def main():
     print(f"Processed Dir:      {slicer_output_dir}")
     print(f"Speaker Tag:        {speaker_name} [{speaker_lang}]")
     print(f"Slice Prefix:       {file_prefix}_XXXXX.wav")
+    print(f"Slicer ASR Model:   {slicer_model_size}")
     print(f"ASR Model:          {model_size} ({device}, {compute_type})")
     if args.sample_seconds:
         print(f"Dry-run Mode:       First {args.sample_seconds} seconds only")
     print("=" * 70)
 
-    # Discover raw audio files
-    raw_files = sorted(list(raw_dir.glob("*.wav")) + list(raw_dir.glob("*.mp3")) + list(raw_dir.glob("*.flac")))
-    if not raw_files:
-        print(f"[!] Error: No audio files found in {raw_dir}")
-        sys.exit(1)
-
+    # Raw audio is only required when slicing actually runs. --skip-slicing
+    # must work on an archived corpus whose raw directory is gone.
+    raw_files: List[Path] = []
     metadata_records = []
     global_slice_idx = 0
 
@@ -260,6 +275,15 @@ def main():
     # STEP 1 & 2: SLICING & NORMALIZATION
     # --------------------------------------------------------------------------
     if not args.skip_slicing:
+        raw_files = sorted(
+            list(raw_dir.glob("*.wav"))
+            + list(raw_dir.glob("*.mp3"))
+            + list(raw_dir.glob("*.flac"))
+        )
+        if not raw_files:
+            print(f"[!] Error: No audio files found in {raw_dir}")
+            sys.exit(1)
+
         print(f"\n>>> STEP 1: Slicing audio files using [{slicer_method.upper()}] and normalizing peak volume...")
         for raw_path in raw_files:
             print(f"\n[*] Slicing source: {raw_path.name}")
@@ -305,8 +329,17 @@ def main():
 
                 sf.write(str(slice_path), norm_audio, sampling_rate, subtype="PCM_16")
 
+                # Final-file telemetry (after fade + normalization) and raw
+                # boundary telemetry (before either) are different things.
+                # The classifier must use the raw level; Phase 3 needs the gain.
                 stats = compute_audio_stats(norm_audio, sampling_rate)
-                edge_metrics = compute_edge_metrics(norm_audio, sampling_rate)
+                raw_stats = compute_audio_stats(chunk_audio, sampling_rate)
+                edge_metrics = compute_edge_metrics(chunk_audio, sampling_rate)
+                applied_gain_db = (
+                    round(stats["rms_db"] - raw_stats["rms_db"], 2)
+                    if raw_stats["rms_db"] > -90.0 and stats["rms_db"] > -90.0
+                    else 0.0
+                )
 
                 metadata_records.append({
                     "id": global_slice_idx,
@@ -319,45 +352,84 @@ def main():
                     "slicer_method": slicer_method,
                     **stats,
                     **edge_metrics,
+                    "raw_rms_db": raw_stats["rms_db"],
+                    "raw_peak_db": raw_stats["peak_db"],
+                    "applied_gain_db": applied_gain_db,
                     "text": "",
                     "chars_per_sec": 0.0,
                     "category": "",
                 })
                 global_slice_idx += 1
 
-        # Idempotency: remove slice files left behind by a previous run so the
-        # folder always matches the metadata written for this run. Only done when
-        # slicing actually ran -- --skip-slicing reads the folder as its input.
-        written_filenames = {record["filename"] for record in metadata_records}
-        stale_slices = [p for p in slices_dir.glob("*.wav") if p.name not in written_filenames]
-        for stale_path in stale_slices:
-            stale_path.unlink()
-        if stale_slices:
-            print(f"    [i] Removed {len(stale_slices)} stale slice file(s) from a previous run.")
+        # Idempotency: remove only this run's stale prefix, never another
+        # profile's files and never a dry-run's other slices.
+        if not args.sample_seconds:
+            written_filenames = {record["filename"] for record in metadata_records}
+            stale_slices = [
+                p for p in slices_dir.glob(f"{file_prefix}_*.wav")
+                if p.name not in written_filenames
+            ]
+            for stale_path in stale_slices:
+                stale_path.unlink()
+            if stale_slices:
+                print(f"    [i] Removed {len(stale_slices)} stale slice file(s) from a previous run.")
     else:
         print("\n[i] Slicing skipped (--skip-slicing). Reading existing slices...")
         existing_slices = sorted(list(slices_dir.glob("*.wav")))
+        if not existing_slices:
+            print(f"[!] Error: No slice files found in {slices_dir}")
+            sys.exit(1)
+
+        # Reuse the previous manifest instead of rebuilding provenance from
+        # the WAV names. The audio file remains the source of truth for
+        # duration/peak/RMS, but source path, offsets, text and category must
+        # survive a retag/retranscribe run.
+        existing_meta_path = slicer_output_dir / metadata_json_name
+        old_by_name: Dict[str, Dict[str, Any]] = {}
+        if existing_meta_path.is_file():
+            try:
+                with open(existing_meta_path, "r", encoding="utf-8") as f:
+                    old_records = json.load(f)
+                if isinstance(old_records, list):
+                    old_by_name = {
+                        str(rec.get("filename")): rec
+                        for rec in old_records
+                        if isinstance(rec, dict) and rec.get("filename")
+                    }
+            except (OSError, json.JSONDecodeError) as exc:
+                print(f"    [!] Warning: could not read existing metadata ({exc}); rebuilding provenance.")
+
         for idx, s_path in enumerate(existing_slices):
             data, file_sampling_rate = sf.read(str(s_path), dtype="float32")
             stats = compute_audio_stats(data, file_sampling_rate)
             edge_metrics = compute_edge_metrics(data, file_sampling_rate)
-            metadata_records.append({
-                "id": idx,
+            old = old_by_name.get(s_path.name, {})
+
+            record = dict(old)
+            record.update({
+                "id": old.get("id", idx),
                 "filename": s_path.name,
                 "relative_path": f"{slicer_method}/{slices_subfolder}/{s_path.name}",
                 "absolute_path": str(s_path),
-                "source_file": "existing",
-                # Source offsets cannot be recovered from a file already on disk;
-                # unknown is honest, zero would imply the slice starts at 0.000s.
-                "start_time_sec": None,
-                "end_time_sec": None,
+                "source_file": old.get("source_file", "existing"),
+                # Unknown offsets stay None; zero would falsely imply 0.000s.
+                "start_time_sec": old.get("start_time_sec"),
+                "end_time_sec": old.get("end_time_sec"),
                 "slicer_method": slicer_method,
                 **stats,
                 **edge_metrics,
-                "text": "",
-                "chars_per_sec": 0.0,
-                "category": "",
+                "text": old.get("text", ""),
             })
+            if "chars_per_sec" not in record or (record.get("text") and not old.get("chars_per_sec")):
+                record["chars_per_sec"] = (
+                    round(len(record["text"]) / (record["duration_sec"] + 1e-6), 2)
+                    if record.get("text") else 0.0
+                )
+            record.setdefault("category", "")
+            record.setdefault("raw_rms_db", record.get("rms_db", -99.0))
+            record.setdefault("raw_peak_db", record.get("peak_db", -99.0))
+            record.setdefault("applied_gain_db", 0.0)
+            metadata_records.append(record)
 
     print(f"\n[+] Total dialogue slices prepared: {len(metadata_records)}")
 

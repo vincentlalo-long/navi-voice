@@ -23,7 +23,9 @@ class CategoryClassifier:
         if not text:
             return "Unknown"
 
-        rms_db = float(stats.get("rms_db", 0.0))
+        # Prefer the pre-normalization level. Peak/R128 normalization removes
+        # the very loudness cue this whisper rule relies on.
+        rms_db = float(stats.get("raw_rms_db", stats.get("rms_db", 0.0)))
 
         # First Pass: Semantic / Keyword Matching with acoustic sub-classification
         for cat_key, cat_cfg in self.rules.items():

@@ -4,7 +4,7 @@ Energy-based Short-Time RMS Audio Slicer (DSP Strategy).
 
 from typing import Any, Dict, List, Tuple
 import numpy as np
-from .base import BaseSlicer, merge_short_segments
+from .base import BaseSlicer, merge_short_segments, validate_intervals
 
 
 class EnergySlicer(BaseSlicer):
@@ -68,24 +68,12 @@ class EnergySlicer(BaseSlicer):
         frames = np.lib.stride_tricks.as_strided(padded, shape=shape, strides=strides)
         return np.sqrt(np.mean(frames**2, axis=-1))
 
-    @staticmethod
-    def _find_clean_split_point(waveform: np.ndarray, target_idx: int, window: int) -> int:
-        """Find the zero-crossing sample with minimum amplitude near target_idx."""
-        w_start = max(0, target_idx - window)
-        w_end = min(len(waveform) - 1, target_idx + window)
-        if w_end <= w_start:
-            return target_idx
-
-        sub_wave = waveform[w_start:w_end]
-        sign_changes = np.where(np.diff(np.signbit(sub_wave)))[0]
-        if len(sign_changes) > 0:
-            abs_amps = np.abs(sub_wave[sign_changes])
-            best_idx = sign_changes[np.argmin(abs_amps)]
-            return int(w_start + best_idx)
-        return int(w_start + np.argmin(np.abs(sub_wave)))
-
     def slice(self, waveform: np.ndarray, sampling_rate: int) -> List[Tuple[int, int]]:
         """Slice waveform into valid speech segments using silence RMS thresholds."""
+        if len(waveform) == 0:
+            return []
+
+        total = len(waveform)
         min_length = int(sampling_rate * self.min_length_ms / 1000)
         min_speech = int(sampling_rate * self.min_speech_ms / 1000)
         max_length = int(sampling_rate * self.max_length_ms / 1000)
@@ -93,8 +81,13 @@ class EnergySlicer(BaseSlicer):
         hop_size = int(sampling_rate * self.hop_size_ms / 1000)
         max_sil_kept = int(sampling_rate * self.max_sil_kept_ms / 1000)
 
-        if len(waveform) < min_speech:
-            return [(0, len(waveform))]
+        # A very short file still has to be distinguished from silence. The old
+        # fallback returned the whole buffer even for an empty/silent input.
+        if total < min_speech:
+            rms_amp = float(np.sqrt(np.mean(np.asarray(waveform, dtype=np.float64) ** 2)))
+            if rms_amp <= 10 ** (self.threshold_db / 20.0):
+                return []
+            return [(0, total)]
 
         rms = self._get_rms(waveform, hop_size * 2, hop_size)
 
@@ -130,63 +123,59 @@ class EnergySlicer(BaseSlicer):
                 is_silent = False
                 silence_regions.append((start_idx * hop_size, i * hop_size))
         if is_silent:
-            silence_regions.append((start_idx * hop_size, len(waveform)))
+            silence_regions.append((start_idx * hop_size, total))
 
-        chunks = []
+        # ``cur_start`` includes padding, while ``speech_start`` is the actual
+        # start of the current speech run. Using the padded start for the
+        # min-speech check made a 400 ms noise blip look like an 800 ms word.
+        chunks: List[Tuple[int, int]] = []
         cur_start = 0
+        speech_start = 0
+        keep_floor = max(1, int(sampling_rate * 0.2))
 
         for sil_start, sil_end in silence_regions:
             sil_duration = sil_end - sil_start
             if sil_duration < min_interval:
                 continue
 
-            chunk_len = sil_start - cur_start
             # Mathematical zero-overlap guarantee:
             # If silence duration is short (< 2 * max_sil_kept), split right in the middle.
             # If silence duration is long, keep max_sil_kept on each boundary.
             if sil_duration < 2 * max_sil_kept:
-                mid = sil_start + sil_duration // 2
-                cut_point = mid
-                next_start = mid
+                cut_point = sil_start + sil_duration // 2
+                next_start = cut_point
             else:
-                cut_point = sil_start + max_sil_kept
-                next_start = sil_end - max_sil_kept
+                cut_point = min(total, sil_start + max_sil_kept)
+                next_start = max(0, sil_end - max_sil_kept)
 
-            if chunk_len >= min_speech:
-                chunks.append((cur_start, min(cut_point, len(waveform))))
-                cur_start = next_start
-            else:
-                # Preceding audio was too short (< min_speech e.g. noise blip or initial silence).
-                # Advance cur_start so it doesn't drag initial noise into next real utterance.
-                cur_start = next_start
+            speech_len = max(0, sil_start - speech_start)
+            # Keep short exclamations too; they are merged below when a
+            # neighbour is close. Only clicks/blips under 200 ms are dropped.
+            if speech_len >= keep_floor and cut_point > cur_start:
+                chunks.append((cur_start, cut_point))
 
-        # Handle final chunk
-        if len(waveform) - cur_start >= min_speech:
-            chunks.append((cur_start, len(waveform)))
+            cur_start = next_start
+            speech_start = sil_end
+
+        if total - speech_start >= keep_floor and cur_start < total:
+            chunks.append((cur_start, total))
 
         # Subdivide segments exceeding max_length with balanced, zero-crossing cuts
-        final_chunks = []
+        final_chunks: List[Tuple[int, int]] = []
         for start, end in chunks:
-            chunk_dur = end - start
-            if chunk_dur <= max_length:
-                final_chunks.append((start, end))
-                continue
-
-            # Balanced k-way split to avoid dropping leftover tails
-            num_splits = int(np.ceil(chunk_dur / max_length))
-            ideal_len = chunk_dur // num_splits
-            cur_p = start
-            search_win = int(sampling_rate * 0.5)
-
-            for s_idx in range(1, num_splits):
-                target_p = start + s_idx * ideal_len
-                clean_cut = self._find_clean_split_point(waveform, target_p, search_win)
-                final_chunks.append((cur_p, clean_cut))
-                cur_p = clean_cut
-            final_chunks.append((cur_p, end))
+            final_chunks.extend(
+                self.balanced_subdivide(
+                    waveform,
+                    sampling_rate,
+                    start,
+                    end,
+                    max_length,
+                    lambda lo, hi: self.find_clean_split_in_range(waveform, lo, hi),
+                )
+            )
 
         # min_length_ms is a target utterance length for TTS: fragments below it are
-        # merged into the next segment when the gap is only a short pause.
+        # merged into a neighbour when the gap is only a short pause.
         final_chunks = merge_short_segments(
             final_chunks,
             min_length_samples=min_length,
@@ -194,4 +183,9 @@ class EnergySlicer(BaseSlicer):
             max_gap_samples=max_sil_kept * 2,
         )
 
-        return final_chunks
+        return validate_intervals(
+            final_chunks,
+            total_samples=total,
+            sampling_rate=sampling_rate,
+            max_length_samples=max_length,
+        )

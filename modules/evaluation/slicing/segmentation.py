@@ -11,15 +11,12 @@ def compute_segmentation_integrity(
     chunks_by_file: List[List[Tuple[int, int]]],
     total_audio_samples: int,
     sampling_rate: int,
-    min_length_ms: int = 2000,
-    max_length_ms: int = 12000,
 ) -> Dict[str, Any]:
     """
     Evaluates segmentation integrity across files:
-      - Retained Audio Ratio (total slice duration / total audio duration)
+      - Audio coverage ratio (total slice duration / total audio duration)
       - Slices per minute
       - Duration statistics (mean, median, p95, min, max)
-      - Tail drop rate %
       - Overlap count & maximum overlap samples (per-file)
     """
     total_audio_sec = total_audio_samples / sampling_rate
@@ -37,7 +34,6 @@ def compute_segmentation_integrity(
             "p95_duration_sec": 0.0,
             "min_duration_sec": 0.0,
             "max_duration_sec": 0.0,
-            "tail_drop_rate_pct": 0.0,
             "overlap_count": 0,
             "max_overlap_ms": 0.0,
         }
@@ -62,7 +58,6 @@ def compute_segmentation_integrity(
                 max_overlap_samples = max(max_overlap_samples, prev_end - next_start)
 
     max_overlap_ms = (max_overlap_samples / sampling_rate) * 1000.0
-    tail_drop_rate = 0.0
 
     return {
         "total_slices": len(all_chunks),
@@ -75,7 +70,6 @@ def compute_segmentation_integrity(
         "p95_duration_sec": round(float(np.percentile(durations_sec, 95)), 2),
         "min_duration_sec": round(float(np.min(durations_sec)), 2),
         "max_duration_sec": round(float(np.max(durations_sec)), 2),
-        "tail_drop_rate_pct": tail_drop_rate,
         "overlap_count": overlap_count,
         "max_overlap_ms": round(max_overlap_ms, 2),
     }

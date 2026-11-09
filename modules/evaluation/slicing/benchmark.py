@@ -8,6 +8,10 @@ from typing import Any, Dict, List, Optional, Tuple
 import gc
 import time
 import json
+import platform
+import sys
+from datetime import datetime, timezone
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 import numpy as np
 import soundfile as sf
@@ -36,6 +40,14 @@ class SlicingBenchmarkSuite:
         self.config = config or {}
         self.output_dir = output_dir or Path("reports/benchmarks")
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _package_version(name: str) -> str:
+        """Return an installed distribution version without failing the report."""
+        try:
+            return importlib_metadata.version(name)
+        except Exception:
+            return "not-installed"
 
     def evaluate_slicer(
         self,
@@ -167,6 +179,41 @@ class SlicingBenchmarkSuite:
                 + ", ".join(name for name, _ in failures)
             )
 
+        # Provenance is part of the deliverable: a result without input identity,
+        # device and dependency versions cannot be reproduced or compared later.
+        total_audio_sec = next(iter(results.values())).get("total_audio_sec", 0.0) if results else 0.0
+        self._run_meta = {
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "evaluation_phase": "Phase 2: Audio Slicing & Boundary Segmentation",
+            "input_files": [str(p) for p in audio_files],
+            "input_file_count": len(audio_files),
+            "sample_seconds": sample_seconds,
+            "total_audio_sec": round(total_audio_sec, 2),
+            "device": self.config.get("device", "unknown"),
+            "whisper_model_size": self.config.get(
+                "whisper_model_size", self.config.get("model_size", "base")
+            ),
+            "compute_type": self.config.get("compute_type", "unknown"),
+            "language": self.config.get("language", "unknown"),
+            "platform": platform.platform(),
+            "python": sys.version.split()[0],
+            "versions": {
+                "numpy": self._package_version("numpy"),
+                "scipy": self._package_version("scipy"),
+                "soundfile": self._package_version("soundfile"),
+                "faster-whisper": self._package_version("faster-whisper"),
+                "torch": self._package_version("torch"),
+                "silero-vad": self._package_version("silero-vad"),
+                "webrtcvad-wheels": self._package_version("webrtcvad-wheels"),
+            },
+            "config": {
+                key: value
+                for key, value in self.config.items()
+                if isinstance(value, (str, int, float, bool, type(None)))
+            },
+            "failed_slicers": [{"slicer": name, "error": error} for name, error in failures],
+        }
+
         # 1. Export High-Level Executive Summary Comparison (PNG)
         png_comparison = self.output_dir / "benchmark_comparison.png"
         try:
@@ -192,12 +239,8 @@ class SlicingBenchmarkSuite:
         json_path = self.output_dir / "benchmark_summary.json"
         export_payload = {
             "_metadata": {
-                "evaluation_phase": "Phase 2: Audio Slicing & Boundary Segmentation",
-                "whisper_model_size": self.config.get("whisper_model_size", self.config.get("model_size", "base")),
-                "compute_type": self.config.get("compute_type", "float16"),
-                "device": self.config.get("device", "cuda"),
-                "language": self.config.get("language", "ja"),
-                "note": "Phase 2 Slicing evaluated on base model. Phase 3 ASR Transcription uses large-v3 for maximum text accuracy."
+                **self._run_meta,
+                "note": "Phase 2 slicing uses the configured slicing model; Phase 3 ASR transcription uses large-v3 for maximum text accuracy.",
             }
         }
         export_payload.update(results)
@@ -221,9 +264,8 @@ class SlicingBenchmarkSuite:
         lines = [
             "# Audio Slicer Comparative Benchmark Report",
             "",
-            "> [!IMPORTANT]",
-            "> **PHASE 2 EVALUATION ONLY: AUDIO SLICING & BOUNDARY SEGMENTATION**  ",
-            "> This benchmark evaluates exclusively **Phase 2 (Audio Slicing & Boundary Segmentation)** of the speech pipeline on continuous dialogue audio (`sample_dialogue.wav`). Downstream stages (Phase 3: Semantic Tagging & ASR, Phase 4: Acoustic Modeling & Downstream Synthesis Quality) are independent and evaluated in subsequent pipeline phases.",
+            "> [!IMPORTANT]",            "> **PHASE 2.1 EVALUATION: AUDIO SLICING & BOUNDARY SEGMENTATION** ",
+            "> This benchmark evaluates exclusively **Phase 2.1 (Audio Slicing & Boundary Segmentation)** of the speech pipeline on the input audio listed in the provenance table below. Downstream stages (Phase 3: Semantic Tagging & ASR, Phase 4: Acoustic Modeling & Downstream Synthesis Quality) are independent and evaluated in subsequent pipeline phases.",
             "",
             "---",
             "",
@@ -280,10 +322,10 @@ class SlicingBenchmarkSuite:
             "",
             "### Table 2: Segmentation Distribution & TTS Golden Range [2s – 10s] Compliance",
             "Evaluates conversational naturalness and attention window safety for autoregressive TTS models.",
-            "`Retained Audio %` is total slice duration / total audio duration; every slice is padded with",
+            "`Audio Coverage %` is total slice duration / total audio duration; every slice is padded with",
             "silence, so this counts silence as retained and is not a speech-only coverage figure.",
             "",
-            "| Slicer Algorithm | Retained Audio % | Mean Duration | Median Duration | P95 Duration | Golden Range [2s-10s] % | Short Phrases (< 2s) % | Run-on (> 10s) % | Over-Max (> 12s) % |",
+            "| Slicer Algorithm | Audio Coverage % (incl. silence) | Mean Duration | Median Duration | P95 Duration | Golden Range [2s-10s] % | Short Phrases (< 2s) % | Run-on (> 10s) % | Over-Max (> 12s) % |",
             "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
         ])
 
@@ -333,28 +375,156 @@ class SlicingBenchmarkSuite:
             line = f"| **`{s_name}`** | {p_time} | **{rtf:.5f}** | {speedup} |"
             lines.append(line)
 
+        # ------------------------------------------------------------------
+        # Dynamic conclusion: every number below is derived from this run.
+        # ------------------------------------------------------------------
+        valid = [(name, res) for name, res in results.items() if not str(name).startswith("_")]
+        if not valid:
+            lines.extend([
+                "",
+                "---",
+                "",
+                "## 5. Engineering Conclusion & Strategy Recommendation",
+                "",
+                "No slicer completed successfully, so no recommendation can be made from this run.",
+                "",
+            ])
+            return "\n".join(lines)
+
+        def _share(durations: List[float], predicate) -> float:
+            if not durations:
+                return 0.0
+            return (sum(1 for duration in durations if predicate(duration)) / len(durations)) * 100.0
+
+        rows = []
+        for name, res in valid:
+            durations = res.get("durations", [])
+            seg = res["segmentation"]
+            bnd = res["boundary"]
+            rows.append({
+                "name": name,
+                "res": res,
+                "golden": _share(durations, lambda d: 2.0 <= d <= 10.0),
+                "short": _share(durations, lambda d: d < 2.0),
+                "runon": _share(durations, lambda d: d > 10.0),
+                "overmax": _share(durations, lambda d: d > 12.0),
+                "cbr": bnd["cbr_pct"],
+                "warn": bnd["warn_pct"],
+                "coverage": seg["audio_coverage_pct"],
+                "rtf": res["rtf"],
+                "slices": seg["total_slices"],
+                "mean": seg["mean_duration_sec"],
+                "p95": seg["p95_duration_sec"],
+            })
+
+        # Prefer a high golden-range share, but never recommend a slicer whose
+        # boundary safety is unacceptable or which still exceeds 12 s.
+        eligible = [row for row in rows if row["cbr"] >= 80.0 and row["overmax"] <= 1.0]
+        primary = max(eligible or rows, key=lambda row: (row["golden"], row["cbr"], -row["rtf"]))
+        fastest = min(rows, key=lambda row: row["rtf"])
+        best_cbr = max(rows, key=lambda row: row["cbr"])
+        best_coverage = max(rows, key=lambda row: row["coverage"])
+        disqualified = [row for row in rows if row["warn"] >= 30.0 or row["runon"] >= 20.0]
+
+        def _metric_line(row) -> str:
+            return (
+                f"{row['golden']:.1f}% in [2s–10s], CBR {row['cbr']:.1f}%, "
+                f"WARN {row['warn']:.1f}%, coverage {row['coverage']:.1f}% "
+                f"(includes silence), mean {row['mean']:.2f}s, P95 {row['p95']:.2f}s, "
+                f"RTF {row['rtf']:.5f} ({1.0 / max(row['rtf'], 1e-9):,.0f}× realtime)"
+            )
+
+        meta = getattr(self, "_run_meta", {})
+        versions = meta.get("versions", {})
         lines.extend([
+            "",
+            "---",
+            "",
+            "## 4b. Benchmark Provenance & Reproducibility",
+            "| Field | Value |",
+            "| :--- | :--- |",
+            f"| Generated (UTC) | {meta.get('generated_at_utc', 'unknown')} |",
+            f"| Input files | {', '.join(Path(p).name for p in meta.get('input_files', [])) or 'unknown'} |",
+            f"| Input duration | {float(meta.get('total_audio_sec', 0.0) or 0.0):.2f} s |",
+            f"| Sample per file | {meta.get('sample_seconds') or 'FULL (100%)'} |",
+            f"| Device | {meta.get('device', 'unknown')} |",
+            f"| Slicing Whisper | {meta.get('whisper_model_size', 'unknown')} ({meta.get('compute_type', 'unknown')}) |",
+            f"| Language | {meta.get('language', 'unknown')} |",
+            f"| Failed slicers | {len(meta.get('failed_slicers', []))} |",
+            "| Versions | "
+            + ", ".join(f"{name} {version}" for name, version in versions.items())
+            + " |",
             "",
             "---",
             "",
             "## 5. Engineering Conclusion & Strategy Recommendation",
             "",
-            "### 🏆 Primary Recommendation for TTS Dataset Creation: `--slicer hybrid`",
-            "For creating production-grade training corpora for modern autoregressive / diffusion TTS architectures (GPT-SoVITS, CosyVoice, VITS, F5-TTS):",
-            "1. **Syntactic & Prosodic Clause Alignment**: Anchors boundaries to linguistic punctuation marks (`。！？`) by construction, ensuring utterances are grammatically complete clauses.",
-            "2. **Superior Golden Range Compliance (86.7% in [2s – 10s])**: Places **86.7%** of utterances directly into the ideal 2s–10s attention training window (mean 5.14s, P95 9.67s), with only 0.1% exceeding 12s.",
-            "3. **Maximal Speech Preservation (99.9% Retained Audio)**: Preserves virtually all dialogue content (12,284.2s out of 12,301.4s), achieving the highest audio retention of all tested strategies.",
-            "4. **DSP Micro-Refinement Minimizes Acoustic Discontinuity**: The micro-refinement layer scans inter-utterance pauses for the lowest RMS silence dip and snaps to zero-crossings, lifting CBR from 77.4% (vanilla Whisper) to **89.8%** and cutting clipping warnings to 10.1% vs 22.5%.",
+            "> All figures in this section are computed from the current `results`; "
+            "no performance constant is stored in the report generator.",
             "",
-            "### ⚡ Secondary Recommendation for Bulk Data Mining: `--slicer energy`",
-            "When processing large-scale raw audio corpora where GPU resources are unavailable:",
-            "- **699× Faster than Real-Time**: Slicing step processes 3.42 hours in just **17.6 seconds** on standard CPU (RTF = 0.00143).",
-            "- **High Boundary Cleanliness (99.5% CBR, 0.5% Warn)**: P95 edge RMS at -46.2 dBFS with only 1.3% exceeding 10s.",
-            "- **Short Segment Merging**: With `merge_short_segments()`, fragments during micro-pauses are cleanly merged, keeping **94.4%** of slices in the Golden Range with sub-2s phrases reduced to just **4.4%**.",
+            f"### Primary Recommendation: `--slicer {primary['name']}`",
+            f"- **Duration suitability:** {primary['golden']:.1f}% of {primary['slices']:,} slices "
+            f"fall in the 2–10 s training window (mean {primary['mean']:.2f} s, P95 {primary['p95']:.2f} s).",
+            f"- **Boundary safety:** CBR {primary['cbr']:.1f}% (CLEAN + SAFE), "
+            f"WARN {primary['warn']:.1f}%, over-12 s share {primary['overmax']:.1f}%.",
+            f"- **Audio coverage:** {primary['coverage']:.1f}% of the source duration is inside slices. "
+            "This metric counts silence as retained; it is not a speech-only coverage figure.",
+            f"- **Cost:** RTF {primary['rtf']:.5f}, i.e. {1.0 / max(primary['rtf'], 1e-9):,.0f}× faster than real time.",
             "",
-            "### ⚠️ Disqualified for High-Quality TTS Training:",
-            "- **`webrtc`**: Unacceptable **37.5% WARN clipping rate**; GMM sub-band classification truncates unvoiced consonants.",
-            "- **`silero`**: Aggressive pause bridging leads to **34.9% run-on utterances > 10s** (mean 8.13s), increasing risk of VRAM exhaustion and attention collapse in autoregressive TTS models.",
+            f"### Secondary Recommendation: `--slicer {fastest['name']}`",
+            f"- Fastest measured strategy: RTF {fastest['rtf']:.5f} "
+            f"({1.0 / max(fastest['rtf'], 1e-9):,.0f}× realtime).",
+            f"- {_metric_line(fastest)}.",
+            "",
+            "### Per-Algorithm Observations",
+        ])
+
+        for row in rows:
+            lines.append(f"- **`{row['name']}`**: {_metric_line(row)}.")
+
+        lines.extend([
+            "",
+            "### Boundary and Coverage Highlights",
+            f"- **Highest CBR:** `{best_cbr['name']}` at {best_cbr['cbr']:.1f}% "
+            f"(WARN {best_cbr['warn']:.1f}%).",
+            f"- **Highest audio coverage:** `{best_coverage['name']}` at "
+            f"{best_coverage['coverage']:.1f}% (includes silence).",
+        ])
+
+        valid_names = {name for name, _ in valid}
+        if "whisper" in valid_names and "hybrid" in valid_names:
+            whisper_row = next(row for row in rows if row["name"] == "whisper")
+            hybrid_row = next(row for row in rows if row["name"] == "hybrid")
+            lines.append(
+                f"- **Hybrid vs Whisper micro-refinement:** CBR "
+                f"{hybrid_row['cbr'] - whisper_row['cbr']:+.1f} pp, WARN reduction "
+                f"{whisper_row['warn'] - hybrid_row['warn']:.1f} pp."
+            )
+
+        if "energy" in valid_names:
+            energy_row = next(row for row in rows if row["name"] == "energy")
+            lines.append(
+                f"- **Energy merge behaviour:** {energy_row['golden']:.1f}% in the golden range, "
+                f"{energy_row['short']:.1f}% below 2 s, {energy_row['runon']:.1f}% above 10 s."
+            )
+
+        if disqualified:
+            lines.extend(["", "### Disqualified for High-Quality TTS Training"])
+            for row in disqualified:
+                reasons = []
+                if row["warn"] >= 30.0:
+                    reasons.append(f"WARN {row['warn']:.1f}%")
+                if row["runon"] >= 20.0:
+                    reasons.append(f"run-on {row['runon']:.1f}% > 10 s")
+                lines.append(f"- **`{row['name']}`**: " + ", ".join(reasons) + ".")
+        else:
+            lines.extend([
+                "",
+                "### No Disqualified Algorithms",
+                "No strategy crossed the disqualification thresholds (WARN ≥ 30% or run-on ≥ 20%).",
+            ])
+
+        lines.extend([
             "",
             "---",
             "",
@@ -374,7 +544,7 @@ class SlicingBenchmarkSuite:
     @staticmethod
     def format_terminal_table(results: Dict[str, Any]) -> str:
         """Render a clean, aligned, compact summary table for terminal display."""
-        header = f"{'Algorithm':<12} {'Slices':>8} {'CBR %':>8} {'Clean %':>9} {'Warn %':>8} {'Retained %':>11} {'Dur (Mean/P95)':>16} {'RTF':>10}"
+        header = f"{'Algorithm':<12} {'Slices':>8} {'CBR %':>8} {'Clean %':>9} {'Warn %':>8} {'Coverage %':>11} {'Dur (Mean/P95)':>16} {'RTF':>10}"
         sep = "-" * len(header)
         lines = [sep, header, sep]
         for s_name, res in results.items():

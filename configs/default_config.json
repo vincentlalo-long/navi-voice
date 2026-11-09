@@ -21,9 +21,11 @@
     "max_length_ms": 12000,
     "min_interval_ms": 400,
     "hop_size_ms": 10,
+    "webrtc_hop_size_ms": 20,
     "max_sil_kept_ms": 400,
     "min_speech_ms": 800,
     "vad_min_speech_ms": 250,
+    "whisper_model_size": "base",
     "normalization_method": "peak",
     "target_lufs": -20.0,
     "adaptive_threshold": false
