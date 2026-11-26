@@ -87,14 +87,18 @@ def _is_pure_punctuation(token: str) -> bool:
 
 
 def _resolve_acoustic_hints(cat_key: str, cat_cfg: Dict[str, Any]) -> Dict[str, Any]:
-    explicit = cat_cfg.get("acoustic_hints")
-    if isinstance(explicit, dict):
-        return explicit
     key_lower = cat_key.lower()
+    default_hints: Dict[str, Any] = {}
     for substr, hints in _DEFAULT_ACOUSTIC_HINTS:
         if substr in key_lower:
-            return hints
-    return {}
+            default_hints = dict(hints)
+            break
+    explicit = cat_cfg.get("acoustic_hints")
+    if isinstance(explicit, dict):
+        merged = dict(default_hints)
+        merged.update(explicit)
+        return merged
+    return default_hints
 
 
 class CategoryClassifier:
@@ -264,7 +268,7 @@ class CategoryClassifier:
         # Axis 2: Lexical & punctuation cue matching
         best_lex_label: Optional[str] = None
         best_lex_hits: List[str] = []
-        best_lex_count = 0
+        best_lex_rank: Tuple[int, float] = (0, 0.0)
 
         raw_scores: Dict[str, float] = {}
         lex_scores: Dict[str, float] = {}
@@ -295,12 +299,12 @@ class CategoryClassifier:
             if matched_kws or punct_match:
                 has_any_lexical_match = True
 
-            if len(matched_kws) > best_lex_count:
-                best_lex_count = len(matched_kws)
+            s_lex = min(1.0, 0.75 * len(matched_kws) + 0.25 * punct_match)
+            if matched_kws and (len(matched_kws), s_lex) > best_lex_rank:
+                best_lex_rank = (len(matched_kws), s_lex)
                 best_lex_label = label
                 best_lex_hits = matched_kws
 
-            s_lex = min(1.0, 0.75 * len(matched_kws) + 0.25 * punct_match)
             s_pros = self._score_prosody(hints, bins)
             lex_scores[label] = s_lex
             raw_scores[label] = 0.60 * s_lex + 0.40 * s_pros

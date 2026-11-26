@@ -16,7 +16,8 @@
         "pitch": ["high"],
         "speed": ["fast", "normal"],
         "energy": ["high"],
-        "valence": -0.35
+        "valence": -0.35,
+        "punctuation": ["！", "!"]
       }
     },
     "defensive_flustered": {
@@ -26,7 +27,8 @@
         "pitch": ["high"],
         "speed": ["fast", "normal"],
         "energy": ["high", "normal"],
-        "valence": -0.2
+        "valence": -0.2,
+        "punctuation": ["？", "?"]
       }
     },
     "gentle_soft": {
@@ -38,7 +40,8 @@
         "pitch": ["low", "normal", "unvoiced"],
         "speed": ["slow", "normal"],
         "energy": ["low", "normal"],
-        "valence": 0.45
+        "valence": 0.45,
+        "punctuation": ["…"]
       }
     },
     "intellectual_analytical": {
@@ -48,7 +51,8 @@
         "pitch": ["normal", "low"],
         "speed": ["normal"],
         "energy": ["normal", "low"],
-        "valence": 0.05
+        "valence": 0.05,
+        "punctuation": []
       }
     },
     "playful_teasing": {
@@ -58,7 +62,8 @@
         "pitch": ["high", "normal"],
         "speed": ["normal", "fast"],
         "energy": ["normal"],
-        "valence": 0.5
+        "valence": 0.5,
+        "punctuation": ["？", "?"]
       }
     },
     "default_label": "Neutral/Dialogue"
