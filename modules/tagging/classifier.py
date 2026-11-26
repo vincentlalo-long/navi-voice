@@ -382,15 +382,15 @@ class CategoryClassifier:
         ]
         non_neutral_items.sort(key=lambda item: item[1], reverse=True)
 
-        all_non_neutral_lex_zero = all(v == 0.0 for v in lex_scores.values())
-        all_non_neutral_raw_zero = all(v == 0.0 for v in raw_scores.values())
+        all_non_neutral_lex_zero = all(
+            v == 0.0 for k, v in lex_scores.items() if k != self.default_label
+        )
         strong_contradiction = (
             bins.get("pitch") == "high" and bins.get("energy") == "low"
         )
-        abstain_contradiction = strong_contradiction and (
-            all_non_neutral_raw_zero
-            or (all_non_neutral_lex_zero and all(s <= 0.25 for _, s, _ in non_neutral_items))
-        )
+        # Unlexicalized high-pitch + low-energy prosody is ambiguous across all
+        # speed bins (including slow), so abstain instead of guessing from prosody alone.
+        abstain_contradiction = strong_contradiction and all_non_neutral_lex_zero
 
         abstain_tie = False
         if len(non_neutral_items) >= 2:

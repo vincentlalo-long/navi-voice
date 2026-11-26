@@ -340,11 +340,18 @@ class TestPipelineEnrichmentCLI(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(proc.returncode, 0, msg=proc.stderr + proc.stdout)
+            self.assertIn("without reusable ASR cache", proc.stdout)
 
             updated = json.loads(meta_path.read_text(encoding="utf-8"))
             self.assertFalse(updated[0]["human_review"]["reviewed"])
             self.assertEqual(updated[0]["qc"]["tier"], "REJECT")
             self.assertIn("ASR_EMPTY_TEXT", updated[0]["qc"]["reasons"])
+            self.assertEqual(updated[0]["source_file"], "existing")
+            self.assertIsNone(updated[0]["start_time_sec"])
+            self.assertIsNone(updated[0]["end_time_sec"])
+            self.assertAlmostEqual(updated[0]["raw_rms_db"], updated[0]["rms_db"], places=4)
+            self.assertAlmostEqual(updated[0]["raw_peak_db"], updated[0]["peak_db"], places=4)
+            self.assertEqual(updated[0]["applied_gain_db"], 0.0)
 
     def test_enrichment_metrics_and_report_handle_empty_and_single_record_safely(self):
         from modules.evaluation import compute_enrichment_metrics, generate_enrichment_report
@@ -607,6 +614,157 @@ class TestPipelineEnrichmentCLI(unittest.TestCase):
             dataset_lines = (out_dir / "energy" / "dataset.list").read_text(encoding="utf-8").splitlines()
             self.assertEqual(len(dataset_lines), 2)
             self.assertTrue(all("|Kurisu|JA|" in line for line in dataset_lines))
+
+    def test_enrichment_audit_apply_curation_mirrors_custom_paths_filenames(self):
+        from modules.enrichment.schema import compute_file_sha256
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            processed_dir = tmp / "energy"
+            slices_dir = processed_dir / "slices"
+            slices_dir.mkdir(parents=True)
+
+            wav_path = slices_dir / "audio_00000.wav"
+            _write_synthetic_wav(wav_path, 240.0)
+            sha = compute_file_sha256(wav_path)
+
+            seed = _seed_record(0, wav_path, "理論的にはその仮説が正しいわ。", sha)
+            seed["qc"] = {
+                "tier": "GOLD",
+                "reasons": [],
+                "usable_for_training": True,
+                "usable_for_reference": True,
+            }
+            seed["human_review"] = {
+                "reviewed": False,
+                "verified_primary": None,
+                "verified_delivery": None,
+                "notes": "",
+            }
+            custom_meta_json = processed_dir / "custom_meta.json"
+            custom_meta_json.write_text(
+                json.dumps([seed], ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            custom_dataset_list = processed_dir / "custom_dataset.list"
+            custom_dataset_list.write_text(
+                f"{wav_path}|Kurisu|JA|placeholder\n",
+                encoding="utf-8",
+            )
+
+            curation_path = tmp / "curation.json"
+            curation_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "filename": wav_path.name,
+                            "audio_sha256": sha,
+                            "human_review": {
+                                "reviewed": True,
+                                "verified_primary": "Playful/Teasing",
+                                "verified_delivery": "whisper_breathy",
+                                "notes": "custom path curation test",
+                            },
+                        }
+                    ],
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            cfg_path = tmp / "custom_paths_config.json"
+            cfg_data = json.loads((REPO_ROOT / "configs" / "default_config.json").read_text(encoding="utf-8"))
+            cfg_data["paths"]["metadata_json"] = "custom_meta.json"
+            cfg_data["paths"]["metadata_csv"] = "custom_meta.csv"
+            cfg_data["paths"]["dataset_list"] = "custom_dataset.list"
+            cfg_path.write_text(json.dumps(cfg_data), encoding="utf-8")
+
+            report_dir = tmp / "audit_custom_paths"
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts" / "run_enrichment_audit.py"),
+                    "--processed-dir", str(processed_dir),
+                    "--output-dir", str(report_dir),
+                    "--apply-curation", str(curation_path),
+                    "--config", str(cfg_path),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(proc.returncode, 0, msg=proc.stderr + proc.stdout)
+
+            updated_custom_meta = json.loads(custom_meta_json.read_text(encoding="utf-8"))
+            self.assertTrue(updated_custom_meta[0]["human_review"]["reviewed"])
+            self.assertEqual(updated_custom_meta[0]["category"], "Playful/Teasing")
+
+            reexported_custom_list = custom_dataset_list.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(reexported_custom_list, [f"{wav_path}|Kurisu|JA|理論的にはその仮説が正しいわ。"])
+
+            custom_csv_path = processed_dir / "custom_meta.csv"
+            self.assertTrue(custom_csv_path.is_file())
+            with custom_csv_path.open("r", encoding="utf-8", newline="") as f:
+                rows = list(csv.DictReader(f))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["effective_category"], "Playful/Teasing")
+            self.assertEqual(rows[0]["human_reviewed"], "True")
+
+    def test_miner_retag_only_rejects_unenriched_phase2_metadata_without_overwriting(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            slices_dir = tmp / "energy" / "slices"
+            slices_dir.mkdir(parents=True)
+
+            wav_path = slices_dir / "audio_00000.wav"
+            _write_synthetic_wav(wav_path, 240.0)
+
+            seed_phase2 = [
+                {
+                    "id": 0,
+                    "filename": wav_path.name,
+                    "relative_path": f"energy/slices/{wav_path.name}",
+                    "absolute_path": str(wav_path),
+                    "source_file": "raw_ep01.wav",
+                    "start_time_sec": 12.5,
+                    "end_time_sec": 17.0,
+                    "slicer_method": "energy",
+                    "duration_sec": 4.5,
+                    "status": "CLEAN",
+                    "clean_boundary": True,
+                    "clipping_rate": 0.0,
+                    "raw_rms_db": -26.5,
+                    "raw_peak_db": -8.2,
+                    "applied_gain_db": 7.2,
+                    "text": "元のPhase2テキスト",
+                    "chars_per_sec": 3.0,
+                    "category": "Neutral",
+                }
+            ]
+            meta_path = tmp / "energy" / "metadata.json"
+            meta_path.write_text(json.dumps(seed_phase2, ensure_ascii=False, indent=2), encoding="utf-8")
+            original_meta_bytes = meta_path.read_bytes()
+
+            cfg_path = tmp / "test_config.json"
+            cfg_data = json.loads((REPO_ROOT / "configs" / "default_config.json").read_text(encoding="utf-8"))
+            cfg_data["paths"]["output_dir"] = str(tmp)
+            cfg_path.write_text(json.dumps(cfg_data), encoding="utf-8")
+
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts" / "voice_dataset_miner.py"),
+                    "--config", str(cfg_path),
+                    "--slicer", "energy",
+                    "--retag-only",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            combined_output = proc.stdout + proc.stderr
+            self.assertIn("ASR", combined_output)
+            self.assertEqual(meta_path.read_bytes(), original_meta_bytes)
+            self.assertFalse((tmp / "energy" / "dataset.list").exists())
 
 
 if __name__ == "__main__":

@@ -13,7 +13,6 @@ Architecture:
 import argparse
 import gc
 import json
-import shutil
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -45,6 +44,7 @@ from modules.enrichment import (
     export_enriched_dataset,
     finalize_record_v2,
     merge_cached_record,
+    mirror_custom_export_paths,
     resolve_effective_emotion,
 )
 from modules.tagging import (
@@ -157,6 +157,18 @@ def _empty_asr_diagnostics(duration_sec: float) -> Dict[str, Any]:
         "effective_mora_rate": round(float(rates["effective_mora_rate"]), 4),
         "hallucination_flags": [],
     }
+
+
+def _select_phase2_field(
+    old_record: Dict[str, Any],
+    key: str,
+    fallback: Any,
+    can_keep: bool,
+) -> Any:
+    """Return cached Phase 2 telemetry field when valid and non-None, else fallback."""
+    if can_keep and old_record.get(key) is not None:
+        return old_record[key]
+    return fallback
 
 
 def _prepare_slice_record(
@@ -293,9 +305,7 @@ def main():
     output_dir = (VOICE_ROOT / paths_cfg.get("output_dir", "datasets/processed")).resolve()
     slices_subfolder = paths_cfg.get("slices_subfolder", "slices")
 
-    metadata_json_name = paths_cfg.get("metadata_json", "metadata.json")
-    metadata_csv_name = paths_cfg.get("metadata_csv", "metadata.csv")
-    dataset_list_name = paths_cfg.get("dataset_list", "dataset.list")
+    metadata_json_name = str(paths_cfg.get("metadata_json") or "metadata.json")
 
     # Speaker parameters
     speaker_cfg = config.get("speaker", {})
@@ -347,6 +357,17 @@ def main():
     if profile_tag:
         slicer_output_dir = slicer_output_dir / profile_tag
     slices_dir = slicer_output_dir / slices_subfolder
+    existing_meta_path = slicer_output_dir / metadata_json_name
+    old_by_name = _load_existing_metadata_map(existing_meta_path)
+    has_any_asr_cache = any(
+        isinstance(rec.get("asr_diagnostics"), dict) for rec in old_by_name.values()
+    )
+    if args.retag_only and not has_any_asr_cache:
+        print(
+            f"[!] Error: Manifest at {existing_meta_path} has not been ASR-enriched yet "
+            "(no cached records contain 'asr_diagnostics'). Run without --retag-only first."
+        )
+        sys.exit(1)
     slices_dir.mkdir(parents=True, exist_ok=True)
 
     raw_files: List[Path] = []
@@ -396,11 +417,6 @@ def main():
     if args.sample_seconds:
         print(f"Dry-run Mode:       First {args.sample_seconds} seconds only")
     print("=" * 70)
-
-    existing_meta_path = slicer_output_dir / metadata_json_name
-    old_by_name = _load_existing_metadata_map(existing_meta_path)
-    if args.retag_only and not old_by_name:
-        print(f"[!] Warning: No existing metadata found at {existing_meta_path}; uncached slices will be treated as empty ASR.")
 
     metadata_records: List[Dict[str, Any]] = []
     has_asr_flags: List[bool] = []
@@ -534,36 +550,35 @@ def main():
             audio_sha256 = compute_file_sha256(s_path)
 
             # Preserve Phase 2 pre-fade/pre-gain boundary telemetry when the WAV matches
-            # or upgrades a legacy Phase 2 manifest; recompute only if WAV changed.
+            # or upgrades a legacy Phase 2 manifest; recompute/reset only if WAV changed.
             old_prov = old.get("provenance") if isinstance(old.get("provenance"), dict) else {}
             old_sha = old_prov.get("audio_sha256")
-            can_keep_phase2_edges = bool(old.get("status")) and (
-                not old_sha or old_sha == audio_sha256
-            )
+            can_keep_phase2_telemetry = not old_sha or old_sha == audio_sha256
+            can_keep_phase2_edges = bool(old.get("status")) and can_keep_phase2_telemetry
             computed_edges = compute_edge_metrics(data, file_sampling_rate)
             if can_keep_phase2_edges:
                 edge_metrics = {
-                    key: old[key] if key in old else computed_edges[key]
+                    key: old[key] if old.get(key) is not None else computed_edges[key]
                     for key in _EDGE_METRIC_KEYS
                 }
             else:
                 edge_metrics = {key: computed_edges[key] for key in _EDGE_METRIC_KEYS}
 
             fresh_base = {
-                "id": old.get("id", idx),
+                "id": old.get("id") if old.get("id") is not None else idx,
                 "filename": s_path.name,
                 "relative_path": old.get("relative_path") or str(s_path.relative_to(output_dir)),
                 "absolute_path": str(s_path),
-                "source_file": old.get("source_file", "existing"),
+                "source_file": _select_phase2_field(old, "source_file", "existing", can_keep_phase2_telemetry),
                 # Unknown offsets stay None; zero would falsely imply 0.000s.
-                "start_time_sec": old.get("start_time_sec"),
-                "end_time_sec": old.get("end_time_sec"),
-                "slicer_method": old.get("slicer_method", slicer_method),
+                "start_time_sec": _select_phase2_field(old, "start_time_sec", None, can_keep_phase2_telemetry),
+                "end_time_sec": _select_phase2_field(old, "end_time_sec", None, can_keep_phase2_telemetry),
+                "slicer_method": old.get("slicer_method") or slicer_method,
                 **stats,
                 **edge_metrics,
-                "raw_rms_db": old.get("raw_rms_db", stats["rms_db"]),
-                "raw_peak_db": old.get("raw_peak_db", stats["peak_db"]),
-                "applied_gain_db": old.get("applied_gain_db", 0.0),
+                "raw_rms_db": _select_phase2_field(old, "raw_rms_db", stats["rms_db"], can_keep_phase2_telemetry),
+                "raw_peak_db": _select_phase2_field(old, "raw_peak_db", stats["peak_db"], can_keep_phase2_telemetry),
+                "applied_gain_db": _select_phase2_field(old, "applied_gain_db", 0.0, can_keep_phase2_telemetry),
                 "text": "",
                 "chars_per_sec": 0.0,
                 "category": "",
@@ -609,6 +624,13 @@ def main():
     reused_count = sum(1 for flag in has_asr_flags if flag)
     if reused_count:
         print(f"[i] Reused cached ASR diagnostics for {reused_count} slice(s) matching SHA-256.")
+    if args.retag_only and reused_count < len(metadata_records):
+        uncached_count = len(metadata_records) - reused_count
+        print(
+            f"[!] Warning: --retag-only left {uncached_count} of {len(metadata_records)} "
+            "slice(s) without reusable ASR cache (WAV changed or ASR model mismatch); "
+            "uncached slices will be marked empty ASR."
+        )
 
     if indices_to_transcribe and metadata_records:
         print(
@@ -701,15 +723,7 @@ def main():
         speaker_lang,
         cfg=config,
     )
-
-    custom_aliases = (
-        ("metadata_json", metadata_json_name, "metadata.json"),
-        ("metadata_csv", metadata_csv_name, "metadata.csv"),
-        ("dataset_list", dataset_list_name, "dataset.list"),
-    )
-    for path_key, configured_name, default_name in custom_aliases:
-        if configured_name != default_name and path_key in exported_paths:
-            shutil.copyfile(exported_paths[path_key], slicer_output_dir / configured_name)
+    mirror_custom_export_paths(exported_paths, slicer_output_dir, paths_cfg)
 
     for label, p in exported_paths.items():
         print(f"    -> {label:22s}: {p}")

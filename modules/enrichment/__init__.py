@@ -5,6 +5,7 @@ from .packager import (
     apply_human_curation_file,
     build_leakage_safe_splits,
     export_enriched_dataset,
+    mirror_custom_export_paths,
     sanitize_list_field,
     select_reference_prompts,
 )
@@ -44,6 +45,7 @@ __all__ = [
     "export_enriched_dataset",
     "finalize_record_v2",
     "merge_cached_record",
+    "mirror_custom_export_paths",
     "resolve_effective_emotion",
     "sanitize_list_field",
     "select_reference_prompts",

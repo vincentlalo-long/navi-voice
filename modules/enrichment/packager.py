@@ -6,6 +6,7 @@ import json
 import math
 import random
 import re
+import shutil
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -624,3 +625,43 @@ def export_enriched_dataset(
         "reference_candidates": ref_candidates_path,
         "reference_prompts": ref_prompts_path,
     }
+
+
+_CUSTOM_EXPORT_ALIASES: Tuple[Tuple[str, str], ...] = (
+    ("metadata_json", "metadata.json"),
+    ("metadata_csv", "metadata.csv"),
+    ("dataset_list", "dataset.list"),
+)
+
+
+def mirror_custom_export_paths(
+    exported_paths: Dict[str, Path],
+    output_dir: Path,
+    paths_cfg: Optional[Dict[str, Any]],
+) -> Dict[str, Path]:
+    """Mirror default export artifacts to configured custom filenames in paths_cfg."""
+    if not isinstance(paths_cfg, dict):
+        return {}
+
+    out_dir = Path(output_dir)
+    mirrored: Dict[str, Path] = {}
+    for path_key, default_name in _CUSTOM_EXPORT_ALIASES:
+        raw_name = paths_cfg.get(path_key)
+        configured_name = str(raw_name).strip() if raw_name is not None else ""
+        if not configured_name or configured_name == default_name:
+            continue
+
+        src_path = exported_paths.get(path_key)
+        if src_path is None:
+            continue
+
+        src_resolved = Path(src_path)
+        dest_path = out_dir / configured_name
+        if dest_path.resolve() == src_resolved.resolve():
+            continue
+
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src_resolved, dest_path)
+        mirrored[path_key] = dest_path
+
+    return mirrored

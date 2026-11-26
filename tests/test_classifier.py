@@ -175,6 +175,32 @@ class TestClassifier(unittest.TestCase):
             "Gentle/Affectionate",
         )
 
+    def test_prosody_contradiction_slow_speed_without_lexical_cues_abstains(self):
+        res = self.clf.classify_rich(
+            "今日は晴れです。",
+            stats={"raw_rms_db": -30.0},
+            prosody={
+                "voiced_fraction": 0.6,
+                "spectral_flatness": 0.05,
+                "spectral_centroid_hz": 1400.0,
+                "f0_iqr_hz": 20.0,
+                "f0_slope_hz_per_sec": 0.0,
+                "bins": {"pitch": "high", "speed": "slow", "energy": "low"},
+            },
+        )
+        self.assertEqual(res["auto_tags"]["status"], "abstained_uncertain")
+        self.assertEqual(res["auto_tags"]["primary"], "Uncertain")
+        self.assertEqual(
+            self.clf.classify(
+                "今日は晴れです。",
+                {
+                    "raw_rms_db": -30.0,
+                    "prosody": {"bins": {"pitch": "high", "speed": "slow", "energy": "low"}},
+                },
+            ),
+            "Neutral/Dialogue",
+        )
+
     def test_legacy_profile_without_acoustic_hints_and_partial_override_merges_punctuation(self):
         legacy_rules = {
             "high_emotion": {

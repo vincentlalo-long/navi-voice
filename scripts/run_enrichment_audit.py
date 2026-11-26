@@ -18,7 +18,11 @@ VOICE_ROOT = SCRIPT_DIR.parent
 if str(VOICE_ROOT) not in sys.path:
     sys.path.insert(0, str(VOICE_ROOT))
 
-from modules.enrichment import apply_human_curation_file, export_enriched_dataset
+from modules.enrichment import (
+    apply_human_curation_file,
+    export_enriched_dataset,
+    mirror_custom_export_paths,
+)
 from modules.evaluation import generate_enrichment_report
 from scripts.voice_dataset_miner import resolve_config
 
@@ -141,13 +145,14 @@ def main() -> None:
         curation_file_str = str(curation_path)
         curation_updated = apply_human_curation_file(records, curation_path, cfg=config)
         print(f"[+] Applied human curation to {curation_updated} record(s) from {curation_path}")
-        export_enriched_dataset(
+        exported_paths = export_enriched_dataset(
             records,
             processed_dir,
             speaker_name,
             speaker_lang,
             cfg=config,
         )
+        mirror_custom_export_paths(exported_paths, processed_dir, paths_cfg)
         print(f"[+] Re-exported dataset artifacts in {processed_dir} ({speaker_name} [{speaker_lang}])")
 
     run_meta = {
