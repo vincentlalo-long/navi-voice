@@ -1,10 +1,13 @@
+import contextlib
 import csv
+import io
 import json
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import soundfile as sf
@@ -414,6 +417,196 @@ class TestPipelineEnrichmentCLI(unittest.TestCase):
             paths_voiced = generate_enrichment_report([voiced_rec], out_voiced_single)
             for p in paths_voiced.values():
                 self.assertTrue(p.is_file(), str(p))
+
+    def test_enrichment_audit_apply_curation_respects_custom_qc_gates(self):
+        from modules.enrichment.schema import compute_file_sha256
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            processed_dir = tmp / "energy"
+            slices_dir = processed_dir / "slices"
+            slices_dir.mkdir(parents=True)
+
+            wav_path = slices_dir / "audio_00000.wav"
+            _write_synthetic_wav(wav_path, 240.0)
+            sha = compute_file_sha256(wav_path)
+
+            # avg_logprob = -0.75 is SILVER under default (-0.60) but GOLD under custom (-0.80)
+            seed = _seed_record(0, wav_path, "理論的にはその仮説が正しいわ。", sha)
+            seed["asr_diagnostics"]["avg_logprob"] = -0.75
+            seed["qc"] = {
+                "tier": "SILVER",
+                "reasons": ["avg_logprob_below_gold"],
+                "usable_for_training": True,
+                "usable_for_reference": False,
+            }
+            seed["human_review"] = {
+                "reviewed": False,
+                "verified_primary": None,
+                "verified_delivery": None,
+                "notes": "",
+            }
+            (processed_dir / "metadata.json").write_text(
+                json.dumps([seed], ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+            curation_entries = [
+                {
+                    "filename": wav_path.name,
+                    "audio_sha256": sha,
+                    "human_review": {
+                        "reviewed": True,
+                        "verified_primary": "Intellectual/Analytical",
+                        "verified_delivery": "normal",
+                        "notes": "promote under custom gold logprob gate",
+                    },
+                }
+            ]
+            curation_path = tmp / "curation.json"
+            curation_path.write_text(json.dumps(curation_entries, ensure_ascii=False), encoding="utf-8")
+
+            custom_cfg_path = tmp / "custom_qc_config.json"
+            cfg_data = json.loads((REPO_ROOT / "configs" / "default_config.json").read_text(encoding="utf-8"))
+            cfg_data["enrichment"]["qc_gates"]["gold"]["min_avg_logprob"] = -0.80
+            custom_cfg_path.write_text(json.dumps(cfg_data), encoding="utf-8")
+
+            report_dir = tmp / "audit_custom_qc"
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts" / "run_enrichment_audit.py"),
+                    "--processed-dir", str(processed_dir),
+                    "--output-dir", str(report_dir),
+                    "--apply-curation", str(curation_path),
+                    "--config", str(custom_cfg_path),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(proc.returncode, 0, msg=proc.stderr + proc.stdout)
+
+            updated_meta = json.loads((processed_dir / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(updated_meta[0]["qc"]["tier"], "GOLD")
+            self.assertTrue(updated_meta[0]["qc"]["usable_for_reference"])
+
+            summary = json.loads((report_dir / "enrichment_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["waterfall"]["gold_count"], 1)
+            self.assertEqual(summary["waterfall"]["silver_count"], 0)
+
+    def test_fresh_slicing_asr_loop_checkpoint_recovery_and_release(self):
+        import scripts.voice_dataset_miner as miner
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            raw_dir = tmp / "raw"
+            out_dir = tmp / "processed"
+            raw_dir.mkdir(parents=True)
+            stale_slices_dir = out_dir / "energy" / "slices"
+            stale_slices_dir.mkdir(parents=True)
+            stale_wav = stale_slices_dir / "audio_00099.wav"
+            _write_synthetic_wav(stale_wav, 200.0, duration_sec=1.0)
+
+            sr = 44100
+            sil_edge = np.zeros(int(sr * 0.5), dtype=np.float32)
+            sil_gap = np.zeros(int(sr * 0.8), dtype=np.float32)
+            t_seg = np.linspace(0, 2.6, int(sr * 2.6), endpoint=False, dtype=np.float32)
+            seg1 = (0.25 * np.sin(2 * np.pi * 240.0 * t_seg)).astype(np.float32)
+            seg2 = (0.25 * np.sin(2 * np.pi * 290.0 * t_seg)).astype(np.float32)
+            raw_wave = np.concatenate([sil_edge, seg1, sil_gap, seg2, sil_edge])
+            sf.write(str(raw_dir / "dialogue_source.wav"), raw_wave, sr, subtype="PCM_16")
+
+            cfg_path = tmp / "slicing_asr_config.json"
+            cfg_data = json.loads((REPO_ROOT / "configs" / "default_config.json").read_text(encoding="utf-8"))
+            cfg_data["paths"]["raw_dir"] = str(raw_dir)
+            cfg_data["paths"]["output_dir"] = str(out_dir)
+            cfg_data["speaker"]["name"] = "Kurisu"
+            cfg_data["speaker"]["language"] = "JA"
+            cfg_path.write_text(json.dumps(cfg_data), encoding="utf-8")
+
+            events = {"init": 0, "transcribed": [], "released": 0, "fail_second": True}
+
+            class FakeTranscriber:
+                def __init__(self, model_size, device, compute_type, language="ja", beam_size=5):
+                    events["init"] += 1
+                    self.model_size = model_size
+                    self.device = device
+
+                def transcribe_file(self, audio_path: Path, duration_sec: float):
+                    events["transcribed"].append(audio_path.name)
+                    if events["fail_second"] and len(events["transcribed"]) == 2:
+                        raise RuntimeError("simulated mid-run ASR error")
+                    text = "理論的には正しいわ。" if audio_path.name == "audio_00000.wav" else "べ、別に！"
+                    return {
+                        "raw_text": text,
+                        "canonical_text": text,
+                        "avg_logprob": -0.20,
+                        "no_speech_prob": 0.02,
+                        "compression_ratio": 1.10,
+                        "mean_word_prob": 0.92,
+                        "speech_duration_sec": max(0.2, duration_sec - 0.3),
+                        "clean_char_count": len(text),
+                        "estimated_mora_count": float(len(text)),
+                        "effective_cps": 4.0,
+                        "effective_mora_rate": 4.5,
+                        "hallucination_flags": [],
+                    }
+
+                def release(self):
+                    events["released"] += 1
+
+            # Pass 1: fresh slicing + ASR failure on 2nd slice -> saves checkpoint & calls release()
+            with mock.patch.object(miner, "HardenedWhisperTranscriber", FakeTranscriber):
+                with mock.patch.object(
+                    sys,
+                    "argv",
+                    ["voice_dataset_miner.py", "--config", str(cfg_path), "--slicer", "energy", "--device", "cpu"],
+                ):
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                        with self.assertRaisesRegex(RuntimeError, "simulated mid-run ASR error"):
+                            miner.main()
+
+            self.assertFalse(stale_wav.exists(), "Stale slice file should be removed after fresh slicing")
+            self.assertEqual(events["init"], 1)
+            self.assertEqual(events["released"], 1)
+            self.assertEqual(events["transcribed"], ["audio_00000.wav", "audio_00001.wav"])
+
+            meta_path = out_dir / "energy" / "metadata.json"
+            self.assertTrue(meta_path.is_file())
+            checkpoint_records = json.loads(meta_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(checkpoint_records), 2)
+            self.assertEqual(checkpoint_records[0]["relative_path"], "energy/slices/audio_00000.wav")
+            self.assertEqual(checkpoint_records[0]["asr_diagnostics"]["canonical_text"], "理論的には正しいわ。")
+            self.assertNotIn("asr_diagnostics", checkpoint_records[1])
+
+            # Pass 2: resume with --skip-slicing -> reuses slice 0 from checkpoint, transcribes only slice 1
+            events["fail_second"] = False
+            events["transcribed"] = []
+            with mock.patch.object(miner, "HardenedWhisperTranscriber", FakeTranscriber):
+                with mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "voice_dataset_miner.py",
+                        "--config", str(cfg_path),
+                        "--slicer", "energy",
+                        "--device", "cpu",
+                        "--skip-slicing",
+                    ],
+                ):
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                        miner.main()
+
+            self.assertEqual(events["init"], 2)
+            self.assertEqual(events["released"], 2)
+            self.assertEqual(events["transcribed"], ["audio_00001.wav"])
+
+            final_records = json.loads(meta_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(final_records), 2)
+            self.assertTrue(all(rec["qc"]["tier"] == "GOLD" for rec in final_records))
+            dataset_lines = (out_dir / "energy" / "dataset.list").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(dataset_lines), 2)
+            self.assertTrue(all("|Kurisu|JA|" in line for line in dataset_lines))
 
 
 if __name__ == "__main__":

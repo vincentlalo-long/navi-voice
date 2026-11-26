@@ -386,6 +386,7 @@ def _iter_curation_entries(payload: Any) -> Iterable[Dict[str, Any]]:
 def apply_human_curation_file(
     records: List[Dict[str, Any]],
     curation_path: Path,
+    cfg: Optional[Dict[str, Any]] = None,
 ) -> int:
     """Apply human-reviewed curation entries back onto matching records in-place."""
     payload = json.loads(Path(curation_path).read_text(encoding="utf-8"))
@@ -417,7 +418,7 @@ def apply_human_curation_file(
             continue
 
         record["human_review"] = _copy_human_review(human_review)
-        record["qc"] = evaluate_slice_qc(record)
+        record["qc"] = evaluate_slice_qc(record, cfg=cfg)
         finalize_record_v2(record)
         updated_filenames.add(filename)
 

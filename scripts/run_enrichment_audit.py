@@ -139,7 +139,7 @@ def main() -> None:
             print(f"[!] Error: Curation file not found: {curation_path}")
             sys.exit(1)
         curation_file_str = str(curation_path)
-        curation_updated = apply_human_curation_file(records, curation_path)
+        curation_updated = apply_human_curation_file(records, curation_path, cfg=config)
         print(f"[+] Applied human curation to {curation_updated} record(s) from {curation_path}")
         export_enriched_dataset(
             records,
