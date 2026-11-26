@@ -36,5 +36,57 @@
     "compute_type": "float16",
     "beam_size": 5,
     "language": "ja"
+  },
+  "enrichment": {
+    "qc_gates": {
+      "asr": {
+        "max_compression_ratio": 2.4,
+        "min_avg_logprob": -1.0,
+        "max_no_speech_prob": 0.6,
+        "no_speech_min_avg_logprob": -0.8,
+        "min_mean_word_prob": 0.45,
+        "under_rate_min_duration_sec": 3.0,
+        "min_effective_cps": 1.2,
+        "max_effective_cps": 18.0,
+        "max_effective_mora_rate": 25.0
+      },
+      "gold": {
+        "allowed_statuses": ["CLEAN", "SAFE"],
+        "max_clipping_rate": 0.0,
+        "min_duration_sec": 2.0,
+        "max_duration_sec": 10.0,
+        "min_avg_logprob": -0.60,
+        "max_no_speech_prob": 0.40,
+        "max_compression_ratio": 2.0,
+        "min_effective_cps": 2.0,
+        "max_effective_cps": 15.0,
+        "reference_status": "CLEAN",
+        "reference_min_duration_sec": 3.5,
+        "reference_max_duration_sec": 8.0
+      },
+      "silver": {
+        "disallowed_statuses": ["TOO_SHORT"],
+        "max_clipping_rate_exclusive": 0.001,
+        "min_duration_sec": 1.2,
+        "max_duration_sec": 12.0,
+        "min_avg_logprob": -1.00,
+        "max_no_speech_prob": 0.60,
+        "max_compression_ratio": 2.4,
+        "min_effective_cps": 1.2,
+        "max_effective_cps": 18.0
+      }
+    },
+    "prosody": {
+      "f0_min_hz": 75.0,
+      "f0_max_hz": 550.0,
+      "min_voiced_fraction_for_pitch_bins": 0.15
+    },
+    "packager": {
+      "val_ratio": 0.05,
+      "block_size": 20,
+      "seed": 42,
+      "top_candidates_per_cat": 8,
+      "active_per_cat": 3
+    }
   }
 }

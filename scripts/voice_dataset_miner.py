@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 """
-Voice Dataset Miner - High-Level Audio Segmentation, Normalization & ASR Pipeline.
+Voice Dataset Miner - High-Level Audio Segmentation, Normalization & Phase 3 Enrichment Pipeline.
 
 Architecture:
-- Slicing Strategy Pattern: Supports multiple VAD algorithms ('energy', 'silero').
-- Acoustic Quality Control: Peak normalization, RMS, clipping rate, and boundary edge checks.
-- GPU-Accelerated ASR: Faster-Whisper Large-V3 for transcription and confidence scores.
-- Dynamic Tagging: Rule-based acoustic/semantic categorization.
-- Standard Exports: JSON, CSV, and TTS .list formats.
+- Slicing Strategy Pattern: Supports multiple VAD algorithms ('energy', 'silero', 'webrtc', 'whisper', 'hybrid').
+- Acoustic Quality Control: Peak/EBU R128 normalization, RMS, clipping rate, and boundary edge checks.
+- Phase 3 Enrichment: Hardened Faster-Whisper ASR with 4-gate anti-hallucination checks,
+  pure-DSP prosody extraction, speaker quantile binning, orthogonal expression classification,
+  3-tier QC (GOLD/SILVER/REJECT), and leakage-safe TTS packaging.
 """
 
 import argparse
-import csv
 import gc
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -33,36 +31,40 @@ from modules.audio import (
     apply_raised_cosine_fade,
     compute_audio_stats,
     compute_edge_metrics,
-    normalize_peak,
     normalize_loudness_ebur128,
+    normalize_peak,
 )
-from modules.tagging import CategoryClassifier
-from modules.slicers import get_slicer
+from modules.enrichment import (
+    HardenedWhisperTranscriber,
+    canonicalize_japanese_text,
+    compute_file_sha256,
+    compute_speaking_rates,
+    evaluate_asr_gates,
+    evaluate_slice_qc,
+    export_enriched_dataset,
+    finalize_record_v2,
+    merge_cached_record,
+    mirror_custom_export_paths,
+    resolve_effective_emotion,
+)
+from modules.tagging import (
+    PROSODY_EXTRACTOR_VERSION,
+    TAGGER_VERSION,
+    CategoryClassifier,
+    assign_speaker_prosody_bins,
+    extract_prosody_features,
+)
 
-
-# ==============================================================================
-# DYNAMIC CUDA PRELOADER
-# ==============================================================================
-def preload_nvidia_cuda_libraries():
-    """
-    Dynamically preloads bundled NVIDIA CUDA shared libraries from Python site-packages
-    into global process memory (mode=RTLD_GLOBAL) so CTranslate2 can resolve dependencies
-    (e.g., libcublas.so.12, libcudnn.so) without manual LD_LIBRARY_PATH environment setup.
-    """
-    import ctypes
-    import glob
-
-    target_prefixes = ("libcublas.so", "libcublasLt.so", "libcudnn.so")
-    for site_pkg in sys.path:
-        for so in glob.glob(os.path.join(site_pkg, "nvidia", "**", "lib", "*.so*"), recursive=True):
-            if "nvblas" in so:
-                continue
-            base = os.path.basename(so)
-            if any(base.startswith(p) for p in target_prefixes):
-                try:
-                    ctypes.CDLL(so, mode=ctypes.RTLD_GLOBAL)
-                except Exception:
-                    pass
+_EDGE_METRIC_KEYS = (
+    "start_rms_db",
+    "end_rms_db",
+    "core_rms_db",
+    "eer_start",
+    "eer_end",
+    "step_jump",
+    "status",
+    "clean_boundary",
+)
 
 
 # ==============================================================================
@@ -92,7 +94,11 @@ def resolve_config(config_arg: str, profile_arg: Optional[str], root_dir: Path) 
     Resolve base configuration and optional profile overlays.
     Profiles can be specified as a direct path or as a name in configs/profiles/<name>.json.
     """
-    base_cfg_path = Path(config_arg).resolve()
+    base_cfg_path = Path(config_arg)
+    if not base_cfg_path.is_absolute():
+        base_cfg_path = (root_dir / base_cfg_path).resolve()
+    else:
+        base_cfg_path = base_cfg_path.resolve()
     config = load_json_file(base_cfg_path)
 
     if profile_arg:
@@ -109,6 +115,108 @@ def resolve_config(config_arg: str, profile_arg: Optional[str], root_dir: Path) 
     return config
 
 
+def _load_existing_metadata_map(meta_path: Path) -> Dict[str, Dict[str, Any]]:
+    """Load existing metadata.json into a filename lookup dictionary."""
+    if not meta_path.is_file():
+        return {}
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            old_records = json.load(f)
+        if isinstance(old_records, list):
+            return {
+                str(rec.get("filename")): rec
+                for rec in old_records
+                if isinstance(rec, dict) and rec.get("filename")
+            }
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"    [!] Warning: could not read existing metadata ({exc}); rebuilding provenance.")
+    return {}
+
+
+def _atomic_write_json(path: Path, payload: Any) -> None:
+    """Atomically write JSON payload via a sibling temp file."""
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _empty_asr_diagnostics(duration_sec: float) -> Dict[str, Any]:
+    """Create a canonical empty-ASR diagnostics block for uncached slices."""
+    rates = compute_speaking_rates("", float(duration_sec))
+    return {
+        "raw_text": "",
+        "canonical_text": "",
+        "avg_logprob": -99.0,
+        "no_speech_prob": 1.0,
+        "compression_ratio": 0.0,
+        "mean_word_prob": 0.0,
+        "speech_duration_sec": round(float(rates["speech_duration_sec"]), 4),
+        "clean_char_count": int(rates["clean_char_count"]),
+        "estimated_mora_count": float(rates["estimated_mora_count"]),
+        "effective_cps": round(float(rates["effective_cps"]), 4),
+        "effective_mora_rate": round(float(rates["effective_mora_rate"]), 4),
+        "hallucination_flags": [],
+    }
+
+
+def _select_phase2_field(
+    old_record: Dict[str, Any],
+    key: str,
+    fallback: Any,
+    can_keep: bool,
+) -> Any:
+    """Return cached Phase 2 telemetry field when valid and non-None, else fallback."""
+    if can_keep and old_record.get(key) is not None:
+        return old_record[key]
+    return fallback
+
+
+def _prepare_slice_record(
+    fresh_base: Dict[str, Any],
+    old_record: Optional[Dict[str, Any]],
+    slice_path: Path,
+    waveform: np.ndarray,
+    sampling_rate: int,
+    speaker_name: str,
+    model_size: str,
+    retag_only: bool,
+    explicit_model_size: Optional[str],
+    f0_min_hz: float,
+    f0_max_hz: float,
+    audio_sha256: Optional[str] = None,
+) -> Tuple[Dict[str, Any], bool]:
+    """Hash slice WAV, merge safe cache fields, attach speaker, and extract prosody."""
+    resolved_sha256 = audio_sha256 or compute_file_sha256(slice_path)
+
+    expected_asr_model = model_size
+    if retag_only and not explicit_model_size and isinstance(old_record, dict):
+        old_prov = old_record.get("provenance")
+        if isinstance(old_prov, dict) and old_prov.get("asr_model"):
+            expected_asr_model = str(old_prov["asr_model"])
+
+    record, can_reuse_asr = merge_cached_record(
+        fresh_base,
+        old_record,
+        resolved_sha256,
+        expected_asr_model=expected_asr_model,
+    )
+    record["speaker"] = speaker_name
+
+    prov = record.setdefault("provenance", {})
+    prov["prosody_version"] = PROSODY_EXTRACTOR_VERSION
+    prov["tagger_version"] = TAGGER_VERSION
+    if not can_reuse_asr:
+        prov.setdefault("asr_model", None)
+
+    record["prosody"] = extract_prosody_features(
+        waveform,
+        sampling_rate,
+        f0_min_hz=f0_min_hz,
+        f0_max_hz=f0_max_hz,
+    )
+    return record, can_reuse_asr
+
+
 # ==============================================================================
 # MAIN PIPELINE
 # ==============================================================================
@@ -116,7 +224,7 @@ def main():
     default_config_path = VOICE_ROOT / "configs" / "default_config.json"
 
     parser = argparse.ArgumentParser(
-        description="Voice Dataset Miner - Audio Slicing, Normalization & ASR Pipeline"
+        description="Voice Dataset Miner - Audio Slicing, Normalization & Phase 3 Enrichment Pipeline"
     )
     parser.add_argument(
         "--config",
@@ -177,9 +285,16 @@ def main():
     parser.add_argument(
         "--skip-transcribe",
         action="store_true",
-        help="Only slice and compute audio stats, skip Whisper transcription",
+        help="Only slice/load audio and compute DSP telemetry, skip Whisper transcription",
+    )
+    parser.add_argument(
+        "--retag-only",
+        action="store_true",
+        help="Implies --skip-slicing; reuse cached ASR by audio SHA-256 and recompute prosody, tags, QC, and exports on CPU without loading Whisper",
     )
     args = parser.parse_args()
+    if args.retag_only:
+        args.skip_slicing = True
 
     # Load and resolve configuration with optional profile overlay
     config = resolve_config(args.config, args.profile, VOICE_ROOT)
@@ -190,9 +305,7 @@ def main():
     output_dir = (VOICE_ROOT / paths_cfg.get("output_dir", "datasets/processed")).resolve()
     slices_subfolder = paths_cfg.get("slices_subfolder", "slices")
 
-    metadata_json_name = paths_cfg.get("metadata_json", "metadata.json")
-    metadata_csv_name = paths_cfg.get("metadata_csv", "metadata.csv")
-    dataset_list_name = paths_cfg.get("dataset_list", "dataset.list")
+    metadata_json_name = str(paths_cfg.get("metadata_json") or "metadata.json")
 
     # Speaker parameters
     speaker_cfg = config.get("speaker", {})
@@ -205,32 +318,33 @@ def main():
     sampling_rate = int(audio_cfg.get("sample_rate", 44100))
     target_peak_db = float(audio_cfg.get("target_peak_db", -1.0))
 
-    # ASR parameters (resolved before Slicer initialization to inject device & model_size)
+    # Enrichment / Prosody parameters
+    enrichment_cfg = config.get("enrichment", {})
+    prosody_cfg = enrichment_cfg.get("prosody", {}) if isinstance(enrichment_cfg, dict) else {}
+    f0_min_hz = float(prosody_cfg.get("f0_min_hz", 75.0))
+    f0_max_hz = float(prosody_cfg.get("f0_max_hz", 550.0))
+
+    # ASR parameters
     asr_cfg = config.get("asr", {})
     model_size = args.model_size or asr_cfg.get("model_size", "large-v3")
     device = args.device or asr_cfg.get("device", "cuda")
-    if device == "cuda":
+    needs_compute_device = (not args.skip_slicing) or (not args.skip_transcribe and not args.retag_only)
+    if device == "cuda" and needs_compute_device:
         import torch
+
         if not torch.cuda.is_available():
             print("[!] Warning: CUDA is not available on this machine. Falling back to CPU.")
             device = "cpu"
+    elif args.retag_only:
+        device = "cpu"
     compute_type = asr_cfg.get("compute_type", "float16")
     language = asr_cfg.get("language", "ja")
     beam_size = int(asr_cfg.get("beam_size", 5))
 
-    # Slicer Strategy Resolution (injecting device and ASR params for neural/semantic slicers)
-    slicer_method = args.slicer or audio_cfg.get("slicer_method", "energy")
     # Slicing and transcription can use different Whisper sizes: the slicer
     # only needs word timings, while Phase 3 needs the strongest ASR model.
+    slicer_method = args.slicer or audio_cfg.get("slicer_method", "energy")
     slicer_model_size = args.slicer_model_size or audio_cfg.get("whisper_model_size", "base")
-    slicer_cfg = audio_cfg.copy()
-    slicer_cfg.update({
-        "device": device,
-        "model_size": slicer_model_size,
-        "compute_type": compute_type,
-        "language": language,
-    })
-    slicer = get_slicer(slicer_method, slicer_cfg)
 
     # Isolate runs by profile/speaker so two profiles can no longer overwrite
     # or clean each other's slices. The no-profile layout stays backwards
@@ -243,37 +357,21 @@ def main():
     if profile_tag:
         slicer_output_dir = slicer_output_dir / profile_tag
     slices_dir = slicer_output_dir / slices_subfolder
+    existing_meta_path = slicer_output_dir / metadata_json_name
+    old_by_name = _load_existing_metadata_map(existing_meta_path)
+    has_any_asr_cache = any(
+        isinstance(rec.get("asr_diagnostics"), dict) for rec in old_by_name.values()
+    )
+    if args.retag_only and not has_any_asr_cache:
+        print(
+            f"[!] Error: Manifest at {existing_meta_path} has not been ASR-enriched yet "
+            "(no cached records contain 'asr_diagnostics'). Run without --retag-only first."
+        )
+        sys.exit(1)
     slices_dir.mkdir(parents=True, exist_ok=True)
 
-    # Semantic / Emotion Classifier
-    classifier = CategoryClassifier(config.get("emotion_rules", {}))
-
-    print("=" * 70)
-    print("VOICE DATASET MINER - PIPELINE INITIALIZED")
-    print("=" * 70)
-    print(f"Base Config:        {args.config}")
-    if args.profile:
-        print(f"Active Profile:     {args.profile}")
-    print(f"Slicing Algorithm:  {slicer_method.upper()} ({slicer.__class__.__name__})")
-    print(f"Raw Input Dir:      {raw_dir}")
-    print(f"Processed Dir:      {slicer_output_dir}")
-    print(f"Speaker Tag:        {speaker_name} [{speaker_lang}]")
-    print(f"Slice Prefix:       {file_prefix}_XXXXX.wav")
-    print(f"Slicer ASR Model:   {slicer_model_size}")
-    print(f"ASR Model:          {model_size} ({device}, {compute_type})")
-    if args.sample_seconds:
-        print(f"Dry-run Mode:       First {args.sample_seconds} seconds only")
-    print("=" * 70)
-
-    # Raw audio is only required when slicing actually runs. --skip-slicing
-    # must work on an archived corpus whose raw directory is gone.
     raw_files: List[Path] = []
-    metadata_records = []
-    global_slice_idx = 0
-
-    # --------------------------------------------------------------------------
-    # STEP 1 & 2: SLICING & NORMALIZATION
-    # --------------------------------------------------------------------------
+    slicer = None
     if not args.skip_slicing:
         raw_files = sorted(
             list(raw_dir.glob("*.wav"))
@@ -284,7 +382,51 @@ def main():
             print(f"[!] Error: No audio files found in {raw_dir}")
             sys.exit(1)
 
-        print(f"\n>>> STEP 1: Slicing audio files using [{slicer_method.upper()}] and normalizing peak volume...")
+        from modules.slicers import get_slicer
+
+        slicer_cfg = audio_cfg.copy()
+        slicer_cfg.update({
+            "device": device,
+            "model_size": slicer_model_size,
+            "compute_type": compute_type,
+            "language": language,
+        })
+        slicer = get_slicer(slicer_method, slicer_cfg)
+
+    # Semantic / Emotion Classifier
+    classifier = CategoryClassifier(config.get("emotion_rules", {}))
+
+    slicer_desc = f"{slicer_method.upper()} ({slicer.__class__.__name__})" if slicer is not None else f"{slicer_method.upper()} (skipped)"
+    print("=" * 70)
+    print("VOICE DATASET MINER - PHASE 3 ENRICHMENT PIPELINE INITIALIZED")
+    print("=" * 70)
+    print(f"Base Config:        {args.config}")
+    if args.profile:
+        print(f"Active Profile:     {args.profile}")
+    print(f"Slicing Algorithm:  {slicer_desc}")
+    print(f"Raw Input Dir:      {raw_dir}")
+    print(f"Processed Dir:      {slicer_output_dir}")
+    print(f"Speaker Tag:        {speaker_name} [{speaker_lang}]")
+    print(f"Slice Prefix:       {file_prefix}_XXXXX.wav")
+    print(f"Slicer ASR Model:   {slicer_model_size}")
+    print(f"ASR Model:          {model_size} ({device}, {compute_type})")
+    if args.retag_only:
+        print("Execution Mode:     RETAG-ONLY (CPU cache reuse, Whisper skipped)")
+    elif args.skip_transcribe:
+        print("Execution Mode:     SKIP-TRANSCRIBE (ASR skipped)")
+    if args.sample_seconds:
+        print(f"Dry-run Mode:       First {args.sample_seconds} seconds only")
+    print("=" * 70)
+
+    metadata_records: List[Dict[str, Any]] = []
+    has_asr_flags: List[bool] = []
+    global_slice_idx = 0
+
+    # --------------------------------------------------------------------------
+    # STEP 1 & 2: SLICING / LOADING SLICES & PROSODY EXTRACTION
+    # --------------------------------------------------------------------------
+    if not args.skip_slicing:
+        print(f"\n>>> STEP 1: Slicing audio files using [{slicer_method.upper()}] and normalizing volume...")
         for raw_path in raw_files:
             print(f"\n[*] Slicing source: {raw_path.name}")
             data, file_sampling_rate = sf.read(str(raw_path), dtype="float32")
@@ -292,9 +434,9 @@ def main():
             if len(data.shape) > 1:
                 data = np.mean(data, axis=1)
 
-            # Polyphase anti-aliased resampling if input file sample rate differs from target
             if file_sampling_rate != sampling_rate:
                 import scipy.signal
+
                 gcd = np.gcd(file_sampling_rate, sampling_rate)
                 up = sampling_rate // gcd
                 down = file_sampling_rate // gcd
@@ -320,13 +462,16 @@ def main():
                 chunk_audio = data[start_idx:end_idx]
                 faded_audio = apply_raised_cosine_fade(chunk_audio, sampling_rate, fade_ms=5.0)
                 if effective_norm == "ebu_r128":
-                    norm_audio = normalize_loudness_ebur128(faded_audio, sampling_rate, target_lufs=target_lufs, max_gain_db=18.0)
+                    norm_audio = normalize_loudness_ebur128(
+                        faded_audio, sampling_rate, target_lufs=target_lufs, max_gain_db=18.0
+                    )
                 else:
-                    norm_audio = normalize_peak(faded_audio, target_peak_db=target_peak_db, max_gain_db=18.0)
+                    norm_audio = normalize_peak(
+                        faded_audio, target_peak_db=target_peak_db, max_gain_db=18.0
+                    )
 
                 slice_filename = f"{file_prefix}_{global_slice_idx:05d}.wav"
                 slice_path = slices_dir / slice_filename
-
                 sf.write(str(slice_path), norm_audio, sampling_rate, subtype="PCM_16")
 
                 # Final-file telemetry (after fade + normalization) and raw
@@ -341,10 +486,10 @@ def main():
                     else 0.0
                 )
 
-                metadata_records.append({
+                fresh_base = {
                     "id": global_slice_idx,
                     "filename": slice_filename,
-                    "relative_path": f"{slicer_method}/{slices_subfolder}/{slice_filename}",
+                    "relative_path": str(slice_path.relative_to(output_dir)),
                     "absolute_path": str(slice_path),
                     "source_file": raw_path.name,
                     "start_time_sec": round(start_idx / sampling_rate, 3),
@@ -358,7 +503,22 @@ def main():
                     "text": "",
                     "chars_per_sec": 0.0,
                     "category": "",
-                })
+                }
+                rec, reused = _prepare_slice_record(
+                    fresh_base,
+                    old_by_name.get(slice_filename),
+                    slice_path,
+                    norm_audio,
+                    sampling_rate,
+                    speaker_name,
+                    model_size,
+                    args.retag_only,
+                    args.model_size,
+                    f0_min_hz,
+                    f0_max_hz,
+                )
+                metadata_records.append(rec)
+                has_asr_flags.append(reused)
                 global_slice_idx += 1
 
         # Idempotency: remove only this run's stale prefix, never another
@@ -374,62 +534,71 @@ def main():
             if stale_slices:
                 print(f"    [i] Removed {len(stale_slices)} stale slice file(s) from a previous run.")
     else:
-        print("\n[i] Slicing skipped (--skip-slicing). Reading existing slices...")
+        print("\n[i] Slicing skipped (--skip-slicing). Reading existing slices & extracting prosody...")
         existing_slices = sorted(list(slices_dir.glob("*.wav")))
         if not existing_slices:
             print(f"[!] Error: No slice files found in {slices_dir}")
             sys.exit(1)
 
-        # Reuse the previous manifest instead of rebuilding provenance from
-        # the WAV names. The audio file remains the source of truth for
-        # duration/peak/RMS, but source path, offsets, text and category must
-        # survive a retag/retranscribe run.
-        existing_meta_path = slicer_output_dir / metadata_json_name
-        old_by_name: Dict[str, Dict[str, Any]] = {}
-        if existing_meta_path.is_file():
-            try:
-                with open(existing_meta_path, "r", encoding="utf-8") as f:
-                    old_records = json.load(f)
-                if isinstance(old_records, list):
-                    old_by_name = {
-                        str(rec.get("filename")): rec
-                        for rec in old_records
-                        if isinstance(rec, dict) and rec.get("filename")
-                    }
-            except (OSError, json.JSONDecodeError) as exc:
-                print(f"    [!] Warning: could not read existing metadata ({exc}); rebuilding provenance.")
-
-        for idx, s_path in enumerate(existing_slices):
+        for idx, s_path in enumerate(tqdm(existing_slices, desc="    Inspecting slices")):
             data, file_sampling_rate = sf.read(str(s_path), dtype="float32")
-            stats = compute_audio_stats(data, file_sampling_rate)
-            edge_metrics = compute_edge_metrics(data, file_sampling_rate)
-            old = old_by_name.get(s_path.name, {})
+            if len(data.shape) > 1:
+                data = np.mean(data, axis=1)
 
-            record = dict(old)
-            record.update({
-                "id": old.get("id", idx),
+            stats = compute_audio_stats(data, file_sampling_rate)
+            old = old_by_name.get(s_path.name, {})
+            audio_sha256 = compute_file_sha256(s_path)
+
+            # Preserve Phase 2 pre-fade/pre-gain boundary telemetry when the WAV matches
+            # or upgrades a legacy Phase 2 manifest; recompute/reset only if WAV changed.
+            old_prov = old.get("provenance") if isinstance(old.get("provenance"), dict) else {}
+            old_sha = old_prov.get("audio_sha256")
+            can_keep_phase2_telemetry = not old_sha or old_sha == audio_sha256
+            can_keep_phase2_edges = bool(old.get("status")) and can_keep_phase2_telemetry
+            computed_edges = compute_edge_metrics(data, file_sampling_rate)
+            if can_keep_phase2_edges:
+                edge_metrics = {
+                    key: old[key] if old.get(key) is not None else computed_edges[key]
+                    for key in _EDGE_METRIC_KEYS
+                }
+            else:
+                edge_metrics = {key: computed_edges[key] for key in _EDGE_METRIC_KEYS}
+
+            fresh_base = {
+                "id": old.get("id") if old.get("id") is not None else idx,
                 "filename": s_path.name,
-                "relative_path": f"{slicer_method}/{slices_subfolder}/{s_path.name}",
+                "relative_path": old.get("relative_path") or str(s_path.relative_to(output_dir)),
                 "absolute_path": str(s_path),
-                "source_file": old.get("source_file", "existing"),
+                "source_file": _select_phase2_field(old, "source_file", "existing", can_keep_phase2_telemetry),
                 # Unknown offsets stay None; zero would falsely imply 0.000s.
-                "start_time_sec": old.get("start_time_sec"),
-                "end_time_sec": old.get("end_time_sec"),
-                "slicer_method": slicer_method,
+                "start_time_sec": _select_phase2_field(old, "start_time_sec", None, can_keep_phase2_telemetry),
+                "end_time_sec": _select_phase2_field(old, "end_time_sec", None, can_keep_phase2_telemetry),
+                "slicer_method": old.get("slicer_method") or slicer_method,
                 **stats,
                 **edge_metrics,
-                "text": old.get("text", ""),
-            })
-            if "chars_per_sec" not in record or (record.get("text") and not old.get("chars_per_sec")):
-                record["chars_per_sec"] = (
-                    round(len(record["text"]) / (record["duration_sec"] + 1e-6), 2)
-                    if record.get("text") else 0.0
-                )
-            record.setdefault("category", "")
-            record.setdefault("raw_rms_db", record.get("rms_db", -99.0))
-            record.setdefault("raw_peak_db", record.get("peak_db", -99.0))
-            record.setdefault("applied_gain_db", 0.0)
-            metadata_records.append(record)
+                "raw_rms_db": _select_phase2_field(old, "raw_rms_db", stats["rms_db"], can_keep_phase2_telemetry),
+                "raw_peak_db": _select_phase2_field(old, "raw_peak_db", stats["peak_db"], can_keep_phase2_telemetry),
+                "applied_gain_db": _select_phase2_field(old, "applied_gain_db", 0.0, can_keep_phase2_telemetry),
+                "text": "",
+                "chars_per_sec": 0.0,
+                "category": "",
+            }
+            rec, reused = _prepare_slice_record(
+                fresh_base,
+                old if old else None,
+                s_path,
+                data,
+                file_sampling_rate,
+                speaker_name,
+                model_size,
+                args.retag_only,
+                args.model_size,
+                f0_min_hz,
+                f0_max_hz,
+                audio_sha256=audio_sha256,
+            )
+            metadata_records.append(rec)
+            has_asr_flags.append(reused)
 
     print(f"\n[+] Total dialogue slices prepared: {len(metadata_records)}")
 
@@ -439,107 +608,151 @@ def main():
     if not args.skip_slicing:
         data = None
         chunks = None
-    slicer.release()
-    slicer = None
+    if slicer is not None:
+        slicer.release()
+        slicer = None
     gc.collect()
 
     # --------------------------------------------------------------------------
-    # STEP 3 & 4: WHISPER ASR & CATEGORY MINING
+    # STEP 3: HARDENED WHISPER ASR (INCREMENTAL & CACHE-AWARE)
     # --------------------------------------------------------------------------
-    if not args.skip_transcribe and metadata_records:
-        print(f"\n>>> STEP 2: Initializing Faster-Whisper ({model_size}) on '{device}'...")
-        try:
-            from faster_whisper import WhisperModel
-        except ImportError:
-            print("[!] Error: 'faster-whisper' package is not installed.")
-            print("    Run: uv pip install -r voice/requirements.txt")
-            sys.exit(1)
+    indices_to_transcribe = [
+        i
+        for i, reused in enumerate(has_asr_flags)
+        if not args.skip_transcribe and not args.retag_only and not reused
+    ]
+    reused_count = sum(1 for flag in has_asr_flags if flag)
+    if reused_count:
+        print(f"[i] Reused cached ASR diagnostics for {reused_count} slice(s) matching SHA-256.")
+    if args.retag_only and reused_count < len(metadata_records):
+        uncached_count = len(metadata_records) - reused_count
+        print(
+            f"[!] Warning: --retag-only left {uncached_count} of {len(metadata_records)} "
+            "slice(s) without reusable ASR cache (WAV changed or ASR model mismatch); "
+            "uncached slices will be marked empty ASR."
+        )
 
-        if device == "cuda":
-            preload_nvidia_cuda_libraries()
-
-        actual_compute = compute_type if device == "cuda" else "int8"
+    if indices_to_transcribe and metadata_records:
+        print(
+            f"\n>>> STEP 2: Initializing HardenedWhisperTranscriber ({model_size}) "
+            f"on '{device}' for {len(indices_to_transcribe)} slice(s)..."
+        )
+        transcriber = HardenedWhisperTranscriber(
+            model_size=model_size,
+            device=device,
+            compute_type=compute_type,
+            language=language,
+            beam_size=beam_size,
+        )
+        checkpoint_every = 50
         try:
-            model = WhisperModel(
-                model_size,
-                device=device,
-                compute_type=actual_compute,
-                local_files_only=True,
-            )
+            for step_num, idx in enumerate(
+                tqdm(indices_to_transcribe, desc="    Transcribing"), start=1
+            ):
+                rec = metadata_records[idx]
+                asr_diag = transcriber.transcribe_file(
+                    Path(rec["absolute_path"]),
+                    float(rec.get("duration_sec", 0.0)),
+                )
+                rec["asr_diagnostics"] = asr_diag
+                rec.setdefault("provenance", {})["asr_model"] = model_size
+                has_asr_flags[idx] = True
+
+                if step_num % checkpoint_every == 0:
+                    _atomic_write_json(existing_meta_path, metadata_records)
         except Exception:
-            model = WhisperModel(
-                model_size,
-                device=device,
-                compute_type=actual_compute,
-                local_files_only=False,
-            )
-
-        print("\n>>> STEP 3: Transcribing audio speech and classifying categories...")
-        for item in tqdm(metadata_records, desc="    Transcribing"):
-            audio_path = item["absolute_path"]
-            segments, _ = model.transcribe(
-                audio_path,
-                language=language,
-                beam_size=beam_size,
-                vad_filter=False,
-            )
-            transcription = "".join([seg.text for seg in segments]).strip()
-            item["text"] = transcription
-
-            cps = len(transcription) / (item["duration_sec"] + 1e-6)
-            item["chars_per_sec"] = round(cps, 2)
-            item["category"] = classifier.classify(transcription, item)
-
-        del segments
-        del model
-        gc.collect()
-        try:
-            import torch
-
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
+            _atomic_write_json(existing_meta_path, metadata_records)
+            raise
+        finally:
+            transcriber.release()
 
     # --------------------------------------------------------------------------
-    # STEP 5: EXPORT METADATA & DATASET LISTS
+    # STEP 4: ASR GATES, SPEAKER PROSODY BINNING, TAGGING & 3-TIER QC
     # --------------------------------------------------------------------------
-    print("\n>>> STEP 4: Exporting metadata and dataset lists...")
-
-    json_path = slicer_output_dir / metadata_json_name
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(metadata_records, f, ensure_ascii=False, indent=2)
-    print(f"    -> Exported JSON metadata: {json_path}")
-
-    csv_path = slicer_output_dir / metadata_csv_name
     if metadata_records:
-        keys = list(metadata_records[0].keys())
-        with open(csv_path, "w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=keys)
-            writer.writeheader()
-            writer.writerows(metadata_records)
-        print(f"    -> Exported CSV spreadsheet: {csv_path}")
+        print("\n>>> STEP 3: Evaluating ASR gates, speaker prosody bins, vocal tags, and QC tiers...")
+        for rec, has_asr in zip(metadata_records, has_asr_flags):
+            if has_asr or args.retag_only:
+                asr_diag = rec.get("asr_diagnostics")
+                if not isinstance(asr_diag, dict):
+                    asr_diag = _empty_asr_diagnostics(float(rec.get("duration_sec", 0.0)))
+                    rec["asr_diagnostics"] = asr_diag
+                elif asr_diag.get("canonical_text") is None:
+                    raw_text = str(asr_diag.get("raw_text") or "")
+                    canonical_text = canonicalize_japanese_text(raw_text)
+                    speech_dur = float(asr_diag.get("speech_duration_sec") or rec.get("duration_sec") or 0.2)
+                    rates = compute_speaking_rates(canonical_text, speech_dur)
+                    asr_diag["canonical_text"] = canonical_text
+                    asr_diag.update(rates)
 
-    list_path = slicer_output_dir / dataset_list_name
-    with open(list_path, "w", encoding="utf-8") as f:
-        for item in metadata_records:
-            if item.get("text"):
-                f.write(f"{item['absolute_path']}|{speaker_name}|{speaker_lang}|{item['text']}\n")
-    print(f"    -> Exported Dataset list: {list_path}")
+                asr_diag["hallucination_flags"] = evaluate_asr_gates(
+                    asr_diag,
+                    float(rec.get("duration_sec", 0.0)),
+                    cfg=config,
+                )
+                rec["qc"] = evaluate_slice_qc(rec, cfg=config)
+            else:
+                rec["qc"] = {
+                    "tier": "PENDING_ASR",
+                    "reasons": [],
+                    "usable_for_training": False,
+                    "usable_for_reference": False,
+                }
 
-    # Category distribution summary
-    if not args.skip_transcribe:
+        assign_speaker_prosody_bins(metadata_records)
+
+        for rec, has_asr in zip(metadata_records, has_asr_flags):
+            if has_asr or args.retag_only:
+                canonical_text = str(rec["asr_diagnostics"].get("canonical_text") or "")
+                rec["vocal_expression"] = classifier.classify_rich(
+                    canonical_text,
+                    rec,
+                    prosody=rec.get("prosody"),
+                )
+                rec["qc"] = evaluate_slice_qc(rec, cfg=config)
+            finalize_record_v2(rec)
+
+    # --------------------------------------------------------------------------
+    # STEP 5: EXPORT ENRICHED DATASET & REPORTS
+    # --------------------------------------------------------------------------
+    print("\n>>> STEP 4: Exporting Schema v2.0 metadata, splits, manifest, and reference prompts...")
+    exported_paths = export_enriched_dataset(
+        metadata_records,
+        slicer_output_dir,
+        speaker_name,
+        speaker_lang,
+        cfg=config,
+    )
+    mirror_custom_export_paths(exported_paths, slicer_output_dir, paths_cfg)
+
+    for label, p in exported_paths.items():
+        print(f"    -> {label:22s}: {p}")
+
+    if metadata_records:
+        tier_counts: Dict[str, int] = {}
+        ref_count = 0
         category_counts: Dict[str, int] = {}
         for item in metadata_records:
-            cat = item.get("category", "Unknown")
-            category_counts[cat] = category_counts.get(cat, 0) + 1
+            qc = item.get("qc") if isinstance(item.get("qc"), dict) else {}
+            tier = str(qc.get("tier") or "UNKNOWN")
+            tier_counts[tier] = tier_counts.get(tier, 0) + 1
+            if qc.get("usable_for_reference") is True:
+                ref_count += 1
+            if qc.get("usable_for_training") is True or args.skip_transcribe:
+                cat, _, _ = resolve_effective_emotion(item)
+                category_counts[cat] = category_counts.get(cat, 0) + 1
 
-        print("\n" + "=" * 50)
-        print("IDENTIFIED CATEGORIES SUMMARY:")
-        print("=" * 50)
-        for cat, count in sorted(category_counts.items(), key=lambda x: -x[1]):
+        print("\n" + "=" * 56)
+        print("PHASE 3 QC & EXPRESSION SUMMARY:")
+        print("=" * 56)
+        for tier_name in ("GOLD", "SILVER", "REJECT", "PENDING_ASR"):
+            if tier_name in tier_counts:
+                print(f"  * QC {tier_name:18s}: {tier_counts[tier_name]:4d} utterances")
+        print(f"  * Reference Eligible     : {ref_count:4d} utterances")
+        print("-" * 56)
+        for cat, count in sorted(category_counts.items(), key=lambda x: (-x[1], x[0])):
             print(f"  * {cat:25s}: {count:4d} utterances")
-        print("=" * 50)
+        print("=" * 56)
 
     print("\n[✓] Pipeline execution finished successfully.")
 

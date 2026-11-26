@@ -11,25 +11,60 @@
   "emotion_rules": {
     "high_emotion": {
       "label": "High-Emotion/Agitated",
-      "keywords": ["！", "!!", "やめて", "嘘でしょ"]
+      "keywords": ["！", "!!", "やめて", "嘘でしょ"],
+      "acoustic_hints": {
+        "pitch": ["high"],
+        "speed": ["fast", "normal"],
+        "energy": ["high"],
+        "valence": -0.35,
+        "punctuation": ["！", "!"]
+      }
     },
     "defensive_flustered": {
       "label": "Defensive/Flustered",
-      "keywords": ["バカ", "べ、別に", "ちょっと", "違うわよ", "あんた"]
+      "keywords": ["バカ", "べ、別に", "ちょっと", "違うわよ", "あんた"],
+      "acoustic_hints": {
+        "pitch": ["high"],
+        "speed": ["fast", "normal"],
+        "energy": ["high", "normal"],
+        "valence": -0.2,
+        "punctuation": ["？", "?"]
+      }
     },
     "gentle_soft": {
       "label": "Gentle/Affectionate",
       "keywords": ["ありがとう", "大丈夫", "そばに", "…ね"],
       "whisper_threshold_db": -32.0,
-      "whisper_label": "Gentle/Whisper"
+      "whisper_label": "Gentle/Whisper",
+      "acoustic_hints": {
+        "pitch": ["low", "normal", "unvoiced"],
+        "speed": ["slow", "normal"],
+        "energy": ["low", "normal"],
+        "valence": 0.45,
+        "punctuation": ["…"]
+      }
     },
     "intellectual_analytical": {
       "label": "Intellectual/Analytical",
-      "keywords": ["理論", "仮説", "実験", "分析", "データ"]
+      "keywords": ["理論", "仮説", "実験", "分析", "データ"],
+      "acoustic_hints": {
+        "pitch": ["normal", "low"],
+        "speed": ["normal"],
+        "energy": ["normal", "low"],
+        "valence": 0.05,
+        "punctuation": []
+      }
     },
     "playful_teasing": {
       "label": "Playful/Teasing",
-      "keywords": ["ふふっ", "面白い", "どうかしら"]
+      "keywords": ["ふふっ", "面白い", "どうかしら"],
+      "acoustic_hints": {
+        "pitch": ["high", "normal"],
+        "speed": ["normal", "fast"],
+        "energy": ["normal"],
+        "valence": 0.5,
+        "punctuation": ["？", "?"]
+      }
     },
     "default_label": "Neutral/Dialogue"
   }

@@ -2,6 +2,7 @@
 Evaluation Module Suite for Voice Pipeline.
 Structured by Pipeline Phases:
   - Phase 1: slicing/ (Speech Slicing, VAD Boundaries, and Segmentation Integrity)
+  - Phase 3: enrichment/ (ASR QC Waterfall, Prosody Telemetry, Category Audits)
   - Phase 3/4: tts/ (TTS Synthesis Quality, Voice Similarity, and Intelligibility)
 """
 
@@ -17,6 +18,10 @@ from .slicing import (
     plot_boundary_acoustic_detail_png,
     plot_duration_distribution_png,
 )
+from .enrichment import (
+    compute_enrichment_metrics,
+    generate_enrichment_report,
+)
 
 __all__ = [
     "evaluate_slice_boundary",
@@ -28,4 +33,6 @@ __all__ = [
     "plot_benchmark_comparison_png",
     "plot_boundary_acoustic_detail_png",
     "plot_duration_distribution_png",
+    "compute_enrichment_metrics",
+    "generate_enrichment_report",
 ]
