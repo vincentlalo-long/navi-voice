@@ -251,12 +251,16 @@ def build_leakage_safe_splits(
     def _can_add(comp_idx: int) -> bool:
         return (total_count - (val_count + comp_sizes[comp_idx])) >= 1
 
-    # Pass 1: prioritize covering distinct emotion categories without exhausting train.
-    while val_count < target_val_count or not val_indices:
+    def _within_overshoot(comp_idx: int) -> bool:
+        new_count = val_count + comp_sizes[comp_idx]
+        return abs(new_count - target_val_count) <= abs(val_count - target_val_count)
+
+    # Pass 1: prioritize covering distinct emotion categories within target overshoot.
+    while val_count < target_val_count:
         best_idx: Optional[int] = None
         best_gain = 0
         for idx in order:
-            if idx in val_indices or not _can_add(idx):
+            if idx in val_indices or not _can_add(idx) or not _within_overshoot(idx):
                 continue
             gain = len(comp_cats[idx] - covered_cats)
             if gain > best_gain:
@@ -270,16 +274,14 @@ def build_leakage_safe_splits(
 
     # Pass 2: approach target_val_count with remaining shuffled components.
     for idx in order:
-        if idx in val_indices or not _can_add(idx):
+        if idx in val_indices or not _can_add(idx) or not _within_overshoot(idx):
             continue
-        new_count = val_count + comp_sizes[idx]
-        if val_count == 0 or abs(new_count - target_val_count) <= abs(val_count - target_val_count):
-            val_indices.add(idx)
-            val_count = new_count
-            if val_count >= target_val_count:
-                break
+        val_indices.add(idx)
+        val_count += comp_sizes[idx]
+        if val_count >= target_val_count:
+            break
 
-    # Fallback: ensure at least 1 val component when len(components) >= 2 and val_ratio > 0.
+    # Fallback: if no component fit target_val_count, pick the smallest eligible component.
     if not val_indices:
         smallest_idx = min(
             (idx for idx in order if _can_add(idx)),
@@ -405,7 +407,13 @@ def apply_human_curation_file(
         entry_sha = entry.get("audio_sha256")
         prov = record.get("provenance") if isinstance(record.get("provenance"), dict) else {}
         record_sha = prov.get("audio_sha256")
-        if entry_sha and entry_sha != record_sha:
+        if (
+            not isinstance(entry_sha, str)
+            or not entry_sha.strip()
+            or not isinstance(record_sha, str)
+            or not record_sha.strip()
+            or entry_sha != record_sha
+        ):
             continue
 
         record["human_review"] = _copy_human_review(human_review)

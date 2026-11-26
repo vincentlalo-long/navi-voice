@@ -320,6 +320,79 @@ class TestPackager(unittest.TestCase):
             self.assertEqual(records[0]["category"], "Defensive/Flustered")
             self.assertEqual(records[0]["qc"]["tier"], "GOLD")
 
+    def test_apply_human_curation_rejects_missing_none_or_empty_sha256(self):
+        records = [
+            _make_record(0, "テストゼロ", cat="Neutral/Dialogue", reviewed=False),
+            _make_record(1, "テストイチ", cat="Neutral/Dialogue", reviewed=False),
+            _make_record(2, "テストニ", cat="Neutral/Dialogue", reviewed=False),
+        ]
+        curation_entries = [
+            {
+                "filename": "audio_00000.wav",
+                # omitted audio_sha256
+                "human_review": {
+                    "reviewed": True,
+                    "verified_primary": "Playful/Teasing",
+                    "verified_delivery": "normal",
+                    "notes": "omitted sha",
+                },
+            },
+            {
+                "filename": "audio_00001.wav",
+                "audio_sha256": None,
+                "human_review": {
+                    "reviewed": True,
+                    "verified_primary": "Playful/Teasing",
+                    "verified_delivery": "normal",
+                    "notes": "none sha",
+                },
+            },
+            {
+                "filename": "audio_00002.wav",
+                "audio_sha256": "",
+                "human_review": {
+                    "reviewed": True,
+                    "verified_primary": "Playful/Teasing",
+                    "verified_delivery": "normal",
+                    "notes": "empty sha",
+                },
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            curation_path = Path(tmpdir) / "missing_sha.json"
+            curation_path.write_text(json.dumps(curation_entries, ensure_ascii=False), encoding="utf-8")
+            updated = apply_human_curation_file(records, curation_path)
+            self.assertEqual(updated, 0)
+            for rec in records:
+                self.assertFalse(rec["human_review"]["reviewed"])
+                self.assertIsNone(rec["human_review"]["verified_primary"])
+                self.assertEqual(rec["category"], "Neutral/Dialogue")
+
+    def test_block_split_pass1_guards_against_large_merged_component_overshoot(self):
+        # 100 records, block_size=10 -> 10 blocks.
+        # Blocks 0..5 (60 records) cover 4 distinct categories and merge via a shared catchphrase,
+        # while blocks 6..9 (10 records each) only cover a single category each.
+        cats = ["Neutral/Dialogue", "Playful/Teasing", "Defensive/Flustered", "Gentle/Affectionate"]
+        records = [
+            _make_record(i, f"個別発話{i}", cat=cats[i % len(cats)] if i < 60 else "Neutral/Dialogue")
+            for i in range(100)
+        ]
+        for block_idx in range(6):
+            idx = block_idx * 10
+            records[idx]["asr_diagnostics"]["canonical_text"] = "共通の口癖"
+            records[idx]["text"] = "共通の口癖"
+
+        # target_val_count = max(1, round(100 * 0.10)) = 10.
+        # Giant merged component has size 60 and covers 4 categories (higher gain than size-10 blocks);
+        # Pass 1 must guard against overshoot and keep val near target_val_count.
+        train_recs, val_recs = build_leakage_safe_splits(records, val_ratio=0.10, block_size=10, seed=42)
+        self.assertGreaterEqual(len(train_recs), 80)
+        self.assertLessEqual(len(val_recs), 20)
+        self.assertGreater(len(val_recs), 0)
+        train_texts = {r["asr_diagnostics"]["canonical_text"] for r in train_recs}
+        val_texts = {r["asr_diagnostics"]["canonical_text"] for r in val_recs}
+        self.assertEqual(train_texts.intersection(val_texts), set())
+
 
 if __name__ == "__main__":
     unittest.main()
